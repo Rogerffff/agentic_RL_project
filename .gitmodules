@@ -1,9 +1,9 @@
 [submodule "recipe"]
 	path = recipe
 	url = https://github.com/verl-project/verl-recipe.git
-[submodule "CaRR"]
-	path = CaRR
-	url = https://github.com/THUDM/CaRR.git
 [submodule "agent-R1"]
 	path = agent-R1
 	url = https://github.com/Rogerffff/agent-R1.git
+[submodule "CaRR"]
+	path = CaRR
+	url = https://github.com/Rogerffff/CaRR.git
