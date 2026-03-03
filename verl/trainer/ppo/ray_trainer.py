@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import inspect
 import json
 import os
 import uuid
@@ -210,6 +211,13 @@ def compute_advantage(
             # Get pre-computed rollout IS weights if available
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
+
+        # Conditionally pass non_tensor_batch only to estimators that accept it
+        _sig = inspect.signature(adv_estimator_fn)
+        if "non_tensor_batch" in _sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in _sig.parameters.values()
+        ):
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
 
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
