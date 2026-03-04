@@ -1,0 +1,78 @@
+# CaRR Deep Search — C-GRPO RL training config
+# Usage: python -m verl.trainer.main_ppo \
+#            --config-path=examples/carr_deepsearch/config --config-name=carr_grpo
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  train_files: examples/carr_deepsearch/data/rl_train.parquet
+  val_files: examples/carr_deepsearch/data/rl_val.parquet
+  return_raw_chat: true
+  max_prompt_length: 4096
+  max_response_length: 61440
+  train_batch_size: 128
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: ${oc.env:SFT_MODEL_PATH}
+    enable_gradient_checkpointing: true
+    trust_remote_code: true
+    use_remove_padding: true
+  actor:
+    strategy: fsdp
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 24576
+    optim:
+      lr: 2.0e-6
+    ppo_mini_batch_size: 16
+    ppo_micro_batch_size_per_gpu: 2
+  rollout:
+    name: sglang
+    mode: async
+    temperature: 1.0
+    top_p: 1.0
+    n: 16
+    gpu_memory_utilization: 0.5
+    multi_turn:
+      enable: true
+      format: hermes
+      max_assistant_turns: 30
+      max_tool_response_length: 10000
+      tool_response_truncate_side: right
+      tool_config_path: examples/carr_deepsearch/config/tool_config/carr_browser_tools.yaml
+    agent:
+      default_agent_loop: carr_tool_agent
+
+  ref:
+    log_prob_micro_batch_size_per_gpu: 2
+
+algorithm:
+  adv_estimator: cgrpo
+  cgrpo_alpha: 0.3
+  use_kl_in_reward: false
+  kl_penalty: kl
+
+reward:
+  reward_model:
+    enable: false
+  custom_reward_function:
+    path: examples/carr_deepsearch/reward/carr_reward.py
+    name: compute_score
+
+trainer:
+  nnodes: 1
+  n_gpus_per_node: 8
+  total_epochs: 3
+  save_freq: 50
+  test_freq: 50
+  project_name: carr_deepsearch
+  experiment_name: carr-cgrpo-qwen3-4b
+  logger: ['console', 'wandb']
+  default_local_dir: ${oc.env:HOME}/checkpoints/carr_deepsearch_rl

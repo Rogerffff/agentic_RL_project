@@ -735,4 +735,815 @@ tools:
 
 ---
 
-（后续部分将继续补充）
+## 第四部分：verl 的 ToolAgentLoop 状态机
+
+**相关文件**：
+- `verl/experimental/agent_loop/tool_agent_loop.py` — ToolAgentLoop 状态机
+- `verl/experimental/agent_loop/agent_loop.py` — AgentLoopBase 基类、AgentLoopOutput、register 装饰器、AgentLoopWorker
+
+### 1. 总体架构
+
+ToolAgentLoop 是 verl 中**多轮工具调用 RL 训练**的核心。它是一个异步状态机，为每个样本独立运行：
+
+```
+AgentLoopWorker (Ray Actor)
+    ├── 管理 N 个并发的 AgentLoop 实例（每个样本一个）
+    ├── 持有 tokenizer、processor、server_manager
+    └── 调用 _run_agent_loop() 为每个样本创建 AgentLoop 并执行
+
+ToolAgentLoop (每个样本一个实例)
+    ├── 状态机: PENDING → GENERATING → PROCESSING_TOOLS → GENERATING → ... → TERMINATED
+    ├── 管理工具的 create/execute/release 生命周期
+    └── 输出: AgentLoopOutput (prompt_ids, response_ids, response_mask, extra_fields)
+```
+
+### 2. AgentData — 轨迹状态容器
+
+```python
+class AgentData:
+    def __init__(self, messages, image_data, video_data, metrics, request_id, tools_kwargs, ...):
+        self.messages = messages         # 完整消息历史 (list[dict])
+        self.request_id = request_id     # 唯一请求 ID
+        self.tools_kwargs = tools_kwargs # 从 parquet extra_info.tools_kwargs 传入
+
+        # Token 级状态
+        self.prompt_ids: list[int] = []        # 累积的 token IDs
+        self.response_ids: list[int] = []      # 最新一轮生成的 token IDs
+        self.response_mask: list[int] = []     # 1=模型生成, 0=工具输出/交互
+        self.response_logprobs: list[float] = []
+
+        # 计数器
+        self.user_turns = 0
+        self.assistant_turns = 0
+
+        # 工具调用临时状态
+        self.tool_calls: list[FunctionCall] = []
+
+        # 额外字段（传给 reward）
+        self.extra_fields: dict[str, Any] = {}
+```
+
+**关键理解**：
+- `response_mask` 是 RL 训练的核心 — 只有 mask=1 的 token 才计算 loss 和 advantage
+- 模型生成的 token mask=1，工具返回的 token mask=0
+- `extra_fields` 是自定义数据的传递通道，最终会出现在 `non_tensor_batch["tool_extra_fields"]` 中
+
+### 3. 状态机详解
+
+```
+PENDING ──→ GENERATING ──→ PROCESSING_TOOLS ──→ GENERATING ──→ ... ──→ TERMINATED
+   │              │                │                                        ↑
+   │              │                └── 执行工具，添加 tool 消息              │
+   │              │                                                        │
+   │              └── 模型生成回复 ──→ 无工具调用 ──────────────────────────┘
+   │              └── 超过 max_assistant_turns ─────────────────────────────┘
+   │              └── response_mask 长度 >= response_length ───────────────┘
+   └── 初始化 prompt_ids（apply_chat_template）
+```
+
+#### 3.1 PENDING → GENERATING
+
+```python
+async def _handle_pending_state(self, agent_data, sampling_params):
+    prompt_ids = await self.apply_chat_template(
+        agent_data.messages, tools=self.tool_schemas, ...
+    )
+    agent_data.prompt_ids = prompt_ids
+    return AgentState.GENERATING
+```
+
+将初始消息 + 工具 schema 通过 tokenizer 的 `apply_chat_template` 转换为 token IDs。
+
+#### 3.2 GENERATING → PROCESSING_TOOLS / TERMINATED
+
+```python
+async def _handle_generating_state(self, agent_data, sampling_params):
+    # 1. 调用推理引擎生成
+    output = await self.server_manager.generate(
+        request_id=agent_data.request_id,
+        prompt_ids=agent_data.prompt_ids,
+        sampling_params=sampling_params, ...
+    )
+
+    # 2. 更新状态
+    agent_data.assistant_turns += 1
+    agent_data.prompt_ids += agent_data.response_ids
+    agent_data.response_mask += [1] * len(agent_data.response_ids)  # ← 模型生成=1
+
+    # 3. 检查终止条件
+    if len(agent_data.response_mask) >= self.response_length:
+        return AgentState.TERMINATED
+    if agent_data.assistant_turns >= self.max_assistant_turns:
+        return AgentState.TERMINATED
+
+    # 4. 提取工具调用
+    _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids)
+
+    # 5. 有工具调用 → PROCESSING_TOOLS，否则 → TERMINATED
+    if agent_data.tool_calls:
+        return AgentState.PROCESSING_TOOLS
+    else:
+        return AgentState.TERMINATED
+```
+
+**关键**：`response_mask += [1] * len(response_ids)` — 模型生成的每个 token 都标记为 1。
+
+#### 3.3 PROCESSING_TOOLS → GENERATING
+
+```python
+async def _handle_processing_tools_state(self, agent_data):
+    # 1. 并行执行所有工具调用
+    tasks = []
+    for tool_call in agent_data.tool_calls[:self.max_parallel_calls]:
+        tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data))
+    responses = await asyncio.gather(*tasks)
+
+    # 2. 处理工具响应，添加 tool 消息
+    for tool_response, tool_reward, _ in responses:
+        message = {"role": "tool", "content": tool_response.text or ""}
+        add_messages.append(message)
+
+    agent_data.messages.extend(add_messages)
+
+    # 3. 将工具消息 tokenize
+    response_ids = await self.apply_chat_template(
+        add_messages, remove_system_prompt=True
+    )
+
+    # 4. 更新状态 — 工具输出 mask=0！
+    agent_data.prompt_ids += response_ids
+    agent_data.response_mask += [0] * len(response_ids)  # ← 工具输出=0
+    agent_data.user_turns += 1
+
+    return AgentState.GENERATING
+```
+
+**关键**：`response_mask += [0] * len(response_ids)` — 工具返回的 token 标记为 0，不参与 RL loss 计算。
+
+### 4. `_call_tool()` — 工具调用的生命周期
+
+```python
+async def _call_tool(self, tool_call, tools_kwargs, agent_data):
+    tool, instance_id = None, None
+    try:
+        tool_name = tool_call.name
+        tool_args = json.loads(tool_call.arguments)
+        tool = self.tools[tool_name]
+        kwargs = tools_kwargs.get(tool_name, {})
+
+        # 每次调用都 create + execute + release！
+        instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
+        tool_response, tool_reward, res = await tool.execute(
+            instance_id, tool_args, agent_data=agent_data
+        )
+    except Exception as e:
+        return ToolResponse(text=f"Error when executing tool: {e}"), 0.0, {}
+    finally:
+        if tool and instance_id:
+            await tool.release(instance_id)  # ← 每次都 release！
+
+    # 截断过长的工具响应
+    if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
+        # 按配置截断 (left/right/both)
+        ...
+
+    return ToolResponse(text=tool_response_text), tool_reward, res
+```
+
+**极其重要的发现**：每次工具调用都是 `create → execute → release` 的完整生命周期！
+
+这意味着：
+- 对于 CaRR 的 3 个浏览器工具，每次调用 `browser.search` 会 create 一个新 instance，execute 完立即 release
+- 如果紧接着调用 `browser.open`，又是一个全新的 create/execute/release 周期
+- **但 CaRR 工具服务器需要同一个 session_id** 才能让 `browser.open` 访问 `browser.search` 留下的 `idx2url`
+
+这就是为什么我们需要 `CaRRSessionManager` — 确保同一个轨迹的所有工具调用共享同一个 server-side session，即使 verl 端每次都做 create/release。
+
+### 5. AgentLoopOutput — 输出结构
+
+```python
+class AgentLoopOutput(BaseModel):
+    prompt_ids: list[int]       # 原始 prompt 的 token IDs
+    response_ids: list[int]     # 所有轮次的 response token IDs（含模型生成+工具输出）
+    response_mask: list[int]    # 1=模型生成, 0=工具输出/padding
+    response_logprobs: list[float] | None  # 模型生成 token 的 log probabilities
+    num_turns: int              # 总轮次数
+    metrics: AgentLoopMetrics   # 性能指标
+    extra_fields: dict[str, Any] = {}  # 额外字段 → non_tensor_batch["tool_extra_fields"]
+```
+
+`run()` 方法最后会设置：
+```python
+output.extra_fields.update({
+    "turn_scores": agent_data.turn_scores,
+    "tool_rewards": agent_data.tool_rewards
+})
+```
+
+我们的 CaRRToolAgentLoop 需要额外写入 `messages` 和 `task_unfinished`。
+
+### 6. register 装饰器 — 注册自定义 AgentLoop
+
+```python
+_agent_loop_registry: dict[str, dict] = {}
+
+def register(agent_name: str):
+    def decorator(subclass):
+        fqdn = f"{subclass.__module__}.{subclass.__qualname__}"
+        _agent_loop_registry[agent_name] = {"_target_": fqdn}
+        return subclass
+    return decorator
+```
+
+使用 `@register("carr_tool_agent")` 装饰自定义类，会将 `{"_target_": "examples.carr_deepsearch.tools.carr_agent_loop.CaRRToolAgentLoop"}` 注册到 registry 中。
+
+`AgentLoopWorker._run_agent_loop()` 在运行时查找 registry 并用 `hydra.utils.instantiate()` 创建实例：
+
+```python
+agent_loop_config = _agent_loop_registry[agent_name]  # {"_target_": "...CaRRToolAgentLoop"}
+agent_loop = hydra.utils.instantiate(
+    config=agent_loop_config,
+    trainer_config=..., server_manager=..., tokenizer=..., processor=...
+)
+output = await agent_loop.run(sampling_params, **kwargs)
+```
+
+通过 `VERL_USE_EXTERNAL_MODULES` 环境变量，在 verl 启动时导入我们的模块，触发 `@register` 装饰器。
+
+### 7. Delta-based Tokenization — 多轮 token 拼接原理
+
+每一轮工具调用后，新的 tool 消息不是重新对整个对话 tokenize，而是只对新增消息 tokenize，然后拼接到已有的 token 序列后面：
+
+```python
+# 在 _handle_processing_tools_state 中:
+response_ids = await self.apply_chat_template(
+    add_messages,                    # 只有新增的 tool 消息
+    remove_system_prompt=True,       # 去掉 system prompt 的 token
+)
+agent_data.prompt_ids += response_ids   # 拼接
+agent_data.response_mask += [0] * len(response_ids)
+```
+
+`remove_system_prompt=True` 是因为 `apply_chat_template` 默认会在开头加 system prompt tokens，但我们只需要新增部分的 delta tokens。
+
+### 8. 对我们 CaRRToolAgentLoop 的影响
+
+| 要点 | 影响 |
+|------|------|
+| 每次 `_call_tool` 都 create/execute/release | CaRRSessionManager 需要在 create 时检查 session 是否已存在，release 时用引用计数 |
+| `agent_data.messages` 存储完整对话历史 | 可以在 `run()` 结束后访问完整消息历史 |
+| `extra_fields` 流入 `non_tensor_batch["tool_extra_fields"]` | 通过此通道传递 messages 和 task_unfinished 给 reward 函数 |
+| `response_mask` 区分模型生成(1)和工具输出(0) | RL 只对 mask=1 的 token 做 loss 和 advantage |
+| `tools_kwargs` 来自 parquet `extra_info.tools_kwargs` | `create_kwargs.search_forbidden_strs` 在此传入 |
+| 需要转换 messages 格式给 CaRR reward server | verl 的 tool 消息格式 ≠ CaRR 的 history 格式 |
+
+---
+
+## 第五部分：verl 的 Reward 系统
+
+**相关文件**：
+- `verl/experimental/reward_loop/reward_manager/naive.py` — NaiveRewardManager
+- `verl/trainer/ppo/reward.py` — reward 函数加载与 reward manager 初始化
+
+### 1. Reward 系统总览
+
+```
+YAML 配置:
+  reward.custom_reward_function.path: "examples/carr_deepsearch/reward/carr_reward.py"
+  reward.custom_reward_function.name: "compute_score"
+      ↓
+reward.py: get_custom_reward_fn() 动态加载
+      ↓
+NaiveRewardManager(compute_score=loaded_fn)
+      ↓
+NaiveRewardManager.run_single(data) → 调用 compute_score() → 返回 reward
+```
+
+### 2. `get_custom_reward_fn()` — 加载自定义 reward 函数
+
+```python
+def get_custom_reward_fn(config):
+    module_path = config.reward.custom_reward_function.path  # Python 文件路径
+    fn_name = config.reward.custom_reward_function.name      # 函数名
+
+    raw_fn = load_extern_object(module_path=module_path, object_name=fn_name)
+
+    # 如果是 async 函数，用 _call_with_kwargs_async 包装
+    if inspect.iscoroutinefunction(raw_fn):
+        return partial(_call_with_kwargs_async, raw_fn, reward_kwargs)
+    else:
+        return partial(_call_with_kwargs, raw_fn, reward_kwargs)
+```
+
+我们的 `compute_score` 是 `async def`，所以会被识别为异步函数。
+
+### 3. `NaiveRewardManager.run_single()` — 核心调用链
+
+```python
+async def run_single(self, data: DataProto) -> dict:
+    data_item = data[0]
+
+    # 1. 解码 response 文本
+    response_ids = data_item.batch["responses"]
+    valid_response_ids = response_ids[:valid_response_length]
+    response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+
+    # 2. 提取参数
+    data_source = data_item.non_tensor_batch["data_source"]
+    ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+    extra_info = data_item.non_tensor_batch.get("extra_info", {})
+
+    # 3. 合并 tool_extra_fields 到 extra_info — 关键！
+    tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields", None)
+    if tool_extra_fields is not None:
+        extra_info.update(tool_extra_fields.items())
+
+    # 4. 调用 compute_score
+    result = await self.compute_score(
+        data_source=data_source,
+        solution_str=response_str,    # 解码后的文本
+        ground_truth=ground_truth,    # 标准答案
+        extra_info=extra_info,        # 包含 messages, rubrics, search_forbidden_strs 等
+    )
+
+    # 5. 解析返回值
+    if isinstance(result, dict):
+        score = result["score"]
+        for key, value in result.items():
+            reward_extra_info[key] = value  # ← 所有 key 都写入 reward_extra_info
+    else:
+        score = result
+
+    return {"reward_score": reward, "reward_extra_info": reward_extra_info}
+```
+
+**数据流关键路径**：
+
+```
+parquet extra_info (rubrics, search_forbidden_strs, ...)
+    ↓ 数据加载
+non_tensor_batch["extra_info"]
+    +
+AgentLoop extra_fields (messages, task_unfinished)
+    ↓ 合并
+non_tensor_batch["tool_extra_fields"]
+    ↓ NaiveRewardManager.run_single() 合并
+extra_info = {rubrics, search_forbidden_strs, messages, task_unfinished, ...}
+    ↓ 传给
+compute_score(data_source, solution_str, ground_truth, extra_info)
+    ↓ 返回
+{"score": 1.0, "outcome_reward": 1.0, "rubric_reward": 0.5}
+    ↓ 所有 key 写入
+non_tensor_batch["outcome_reward"], non_tensor_batch["rubric_reward"]
+    ↓ 传给
+C-GRPO advantage estimator
+```
+
+### 4. compute_score 的签名约定
+
+```python
+async def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
+    """
+    Args:
+        data_source: 数据集名称 (如 "carr_deepsearch")
+        solution_str: 解码后的模型输出文本 (所有轮次拼接, skip_special_tokens=True)
+        ground_truth: 标准答案 (来自 parquet reward_model.ground_truth)
+        extra_info: 合并后的额外信息
+
+    Returns:
+        float: 单一 score
+        或 dict: {"score": float, ...其他 key 会被写入 non_tensor_batch}
+    """
+```
+
+返回 dict 时，`score` 字段写入 `rm_scores` tensor（作为默认 reward），其余 key 写入 `non_tensor_batch`，可以在 advantage 计算阶段使用。
+
+---
+
+## 第六部分：verl 的 Advantage Estimation 与 C-GRPO
+
+**相关文件**：
+- `verl/trainer/ppo/core_algos.py` — AdvantageEstimator 枚举、register_adv_est、compute_grpo_outcome_advantage
+- `verl/trainer/ppo/ray_trainer.py:130` — compute_advantage() 入口
+
+### 1. Advantage Estimator 注册机制
+
+```python
+# core_algos.py
+ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
+
+def register_adv_est(name_or_enum):
+    def decorator(fn):
+        name = name_or_enum.value if isinstance(name_or_enum, Enum) else name_or_enum
+        ADV_ESTIMATOR_REGISTRY[name] = fn
+        return fn
+    return decorator
+```
+
+注册一个新的 advantage estimator 只需：
+```python
+@register_adv_est("cgrpo")
+def compute_cgrpo_advantage(...):
+    ...
+```
+
+然后在 YAML 配置中设置 `algorithm.adv_estimator: cgrpo`。
+
+### 2. `compute_advantage()` — 入口函数
+
+```python
+def compute_advantage(data, adv_estimator, ...):
+    if adv_estimator == AdvantageEstimator.GAE:
+        # GAE 特殊处理
+        ...
+    elif adv_estimator == AdvantageEstimator.GRPO:
+        # GRPO 特殊处理（为了向后兼容）
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            ...
+        )
+    else:
+        # 所有其他 estimator（包括我们的 cgrpo）走这个分支
+        adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
+        adv_kwargs = {
+            "token_level_rewards": data.batch["token_level_rewards"],
+            "response_mask": data.batch["response_mask"],
+            "config": config,
+        }
+        if "uid" in data.non_tensor_batch:
+            adv_kwargs["index"] = data.non_tensor_batch["uid"]
+
+        # 自动检测函数签名，如果接受 non_tensor_batch 就传入
+        _sig = inspect.signature(adv_estimator_fn)
+        if "non_tensor_batch" in _sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in _sig.parameters.values()
+        ):
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
+
+        advantages, returns = adv_estimator_fn(**adv_kwargs)
+```
+
+**好消息**：当前代码已经自动检测函数签名，如果我们的 `compute_cgrpo_advantage` 接受 `non_tensor_batch` 参数或 `**kwargs`，`non_tensor_batch` 会被自动传入。**不需要修改 ray_trainer.py**（实施计划中提到的 1 行修改已经被 verl 上游合入）。
+
+### 3. GRPO Advantage — 我们 C-GRPO 的基础
+
+```python
+@register_adv_est("grpo")
+def compute_grpo_outcome_advantage(token_level_rewards, response_mask, index, ...):
+    # 1. 计算每个样本的总 reward
+    scores = token_level_rewards.sum(dim=-1)  # (batch_size,)
+
+    # 2. 按 uid 分组
+    id2score = defaultdict(list)
+    for i in range(bsz):
+        id2score[index[i]].append(scores[i])
+
+    # 3. 组内归一化: (score - mean) / std
+    for i in range(bsz):
+        scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+
+    # 4. 扩展到 token 级别
+    scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
+```
+
+GRPO 的核心：同一个问题的多个采样（由 `index`/`uid` 标识），组内做 (score - mean) / std 归一化，使得组内相对表现好的样本有正 advantage，差的有负 advantage。
+
+### 4. C-GRPO — 我们的自定义 advantage
+
+C-GRPO 在 GRPO 基础上增加了 rubric 奖励的乘性调节：
+
+```
+R_i = (1-α) * outcome_i + α * outcome_i * (rubric_i / max_rubric_in_group)
+```
+
+实现要点：
+1. 从 `non_tensor_batch` 读取 `outcome_reward` 和 `rubric_reward`（compute_score 返回值中的额外 key）
+2. 按 uid 分组，组内对 rubric_reward 做 max 归一化
+3. 计算 C-GRPO 混合奖励
+4. 替换 `token_level_rewards` 中最后一个 valid token 的奖励值
+5. 调用标准 `compute_grpo_outcome_advantage` 做组内归一化
+
+```python
+@register_adv_est("cgrpo")
+def compute_cgrpo_advantage(token_level_rewards, response_mask, index,
+                            config=None, non_tensor_batch=None, **kwargs):
+    alpha = getattr(config, "cgrpo_alpha", 0.3)
+
+    outcome = np.array(non_tensor_batch["outcome_reward"])
+    rubric = np.array(non_tensor_batch["rubric_reward"])
+
+    # 组内归一化 rubric
+    for uid, indices in id2indices.items():
+        max_rubric = rubric[indices].max()
+        if max_rubric > 0:
+            normalized_rubric[indices] = rubric[indices] / max_rubric
+
+    # C-GRPO 混合
+    cgrpo_rewards = (1-alpha) * outcome + alpha * outcome * normalized_rubric
+
+    # 替换 token_level_rewards
+    for i in range(bsz):
+        valid_len = int(response_mask[i].sum())
+        if valid_len > 0:
+            new_rewards[i, valid_len - 1] = cgrpo_rewards[i]
+
+    # 调用标准 GRPO
+    return compute_grpo_outcome_advantage(
+        token_level_rewards=new_rewards, response_mask=response_mask,
+        index=index, ...
+    )
+```
+
+### 5. 对我们实现的影响
+
+| 要点 | 影响 |
+|------|------|
+| `compute_advantage` 已自动传 `non_tensor_batch` | 不需要修改 `ray_trainer.py` |
+| `register_adv_est("cgrpo")` 注册名必须与 YAML 中 `algorithm.adv_estimator` 一致 | YAML 设置 `adv_estimator: cgrpo` |
+| `non_tensor_batch["outcome_reward"]` 来自 compute_score 返回的 dict | compute_score 必须返回 `{"score": ..., "outcome_reward": ..., "rubric_reward": ...}` |
+| `index` 参数就是 `uid`，用于分组 | GRPO 的 n=16 表示每个问题采样 16 次 |
+| 通过 `VERL_USE_EXTERNAL_MODULES` 导入触发 `@register_adv_est` | 启动脚本中设置环境变量 |
+
+---
+
+## 第七部分：数据预处理
+
+**相关文件**：
+- `examples/data_preprocess/gsm8k_tool_agent_loop.py` — RL 数据预处理参考
+- `examples/data_preprocess/gsm8k_multiturn_sft.py` — SFT 数据预处理参考
+- `verl/utils/dataset/multiturn_sft_dataset.py` — MultiTurnSFTDataset
+
+### 1. RL 数据格式
+
+RL 数据的 parquet 需要以下字段（参考 gsm8k_tool_agent_loop.py）：
+
+```python
+{
+    "data_source": "carr_deepsearch",       # 数据集标识
+    "agent_name": "carr_tool_agent",        # AgentLoop 注册名
+    "prompt": [                             # 初始消息（会传给 AgentLoop.run() 的 raw_prompt）
+        {"role": "system", "content": "..."},
+        {"role": "user", "content": "问题内容"}
+    ],
+    "ability": "deepsearch",                # 能力标签（用于日志/分析）
+    "reward_model": {
+        "style": "rule",                    # 使用规则/自定义 reward
+        "ground_truth": "正确答案"           # 传给 compute_score 的 ground_truth
+    },
+    "extra_info": {                         # 额外信息
+        "rubrics": ["<E0> is...", ...],     # rubric 列表
+        "search_forbidden_strs": ["问题文本"],  # 防作弊字符串
+        "rubric_reward_ratio": 0.3,         # rubric 奖励比例
+        "need_tools_kwargs": True,          # 标记需要传 tools_kwargs
+        "tools_kwargs": {                   # 每个工具的创建参数
+            "browser.search": {
+                "create_kwargs": {"search_forbidden_strs": ["问题文本"]}
+            },
+            "browser.open": {
+                "create_kwargs": {"search_forbidden_strs": ["问题文本"]}
+            },
+            "browser.find": {
+                "create_kwargs": {}
+            }
+        }
+    }
+}
+```
+
+**数据流**：
+- `prompt` → `AgentLoop.run(raw_prompt=prompt)`
+- `agent_name` → 查找 registry 选择 AgentLoop 类
+- `reward_model.ground_truth` → `compute_score(ground_truth=...)`
+- `extra_info` → `non_tensor_batch["extra_info"]` → 合并到 `compute_score(extra_info=...)`
+- `extra_info.tools_kwargs` → `AgentLoop.run(tools_kwargs=...)` → `_call_tool(tools_kwargs=...)`
+
+### 2. SFT 数据格式
+
+SFT 数据的 parquet 使用 `MultiTurnSFTDataset` 加载，需要：
+
+```python
+{
+    "messages": [                # 完整多轮对话（Qwen3 格式）
+        {"role": "user", "content": "问题"},
+        {"role": "assistant", "content": null, "reasoning_content": "思考...",
+         "tool_calls": [{"type": "function", "id": "call_0",
+                         "function": {"name": "browser.search",
+                                      "arguments": "{\"query\": \"...\"}"}}]},
+        {"role": "tool", "content": "搜索结果文本"},
+        ...
+        {"role": "assistant", "content": "最终回答"}
+    ],
+    "tools": [                   # 工具定义（OpenAI 格式）
+        {"type": "function", "function": {"name": "browser.search", ...}},
+        ...
+    ],
+    "enable_thinking": true      # 启用 Qwen3 thinking mode
+}
+```
+
+**CaRR → Qwen3 格式转换要点**：
+
+| CaRR 格式 | Qwen3 格式 |
+|-----------|-----------|
+| `tool_calls: [{"tool_call_id": "tc-xxx", "name": "...", "arguments": {...}}]` | `tool_calls: [{"type": "function", "id": "call_0", "function": {"name": "...", "arguments": "{...}"}}]` |
+| `arguments` 是 dict | `arguments` 是 JSON 字符串 |
+| `tool.content: [{"output": "text"}]` | `tool.content: "text"` |
+| `tools: [{"name": "...", "parameters": {...}}]` | `tools: [{"type": "function", "function": {"name": "...", "parameters": {...}}}]` |
+
+### 3. SFT 配置要点
+
+```yaml
+data:
+  multiturn:
+    enable: true
+    messages_key: messages          # parquet 中消息列的 key
+    tools_key: tools                # parquet 中工具定义列的 key
+    enable_thinking_key: enable_thinking  # 启用 thinking mode 的 key
+```
+
+`MultiTurnSFTDataset` 会读取这些 key，用 tokenizer 的 `apply_chat_template` 将消息和工具定义转换为 token 序列，并生成 loss mask（只对 assistant 消息的 token 计算 loss）。
+
+### 4. 预处理验证
+
+数据预处理后务必验证：
+
+```python
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B")
+
+# SFT 验证
+sample = df.iloc[0]
+text = tok.apply_chat_template(
+    sample["messages"],
+    tools=sample.get("tools"),
+    tokenize=False,
+    enable_thinking=sample.get("enable_thinking", False)
+)
+print(text[:500])  # 检查格式是否正确
+
+# RL 验证
+sample = df.iloc[0]
+assert sample["agent_name"] == "carr_tool_agent"
+assert "rubrics" in sample["extra_info"]
+assert "browser.search" in sample["extra_info"]["tools_kwargs"]
+```
+
+---
+
+## 第八部分：端到端数据流总结
+
+将前七部分串联起来，描述从数据到训练的完整数据流。
+
+### 1. RL 训练数据流
+
+```
+                                    ┌─────────────────────────────────────────┐
+                                    │         parquet 数据                     │
+                                    │  prompt, agent_name, reward_model,      │
+                                    │  extra_info (rubrics, tools_kwargs...)  │
+                                    └──────────────────┬──────────────────────┘
+                                                       │
+                                                       ▼
+                                    ┌─────────────────────────────────────────┐
+                                    │      AgentLoopWorker.generate_sequences │
+                                    │  按 agent_name 查找 registry            │
+                                    │  为每个样本创建 CaRRToolAgentLoop       │
+                                    └──────────────────┬──────────────────────┘
+                                                       │
+                                                       ▼
+                              ┌─────────────────────────────────────────────────┐
+                              │          CaRRToolAgentLoop.run()                 │
+                              │                                                 │
+                              │  PENDING → 初始 prompt tokenize                 │
+                              │     ↓                                           │
+                              │  GENERATING → 模型生成 (response_mask=[1,1,...]) │
+                              │     ↓                                           │
+                              │  PROCESSING_TOOLS → 调用 CaRRBrowserTool        │
+                              │     │                                           │
+                              │     │  _call_tool():                            │
+                              │     │    create() → CaRRSessionManager.acquire()│
+                              │     │    execute() → HTTP POST to tool server   │
+                              │     │    release() → CaRRSessionManager.release()│
+                              │     │                                           │
+                              │     ↓  tool 消息 tokenize (response_mask=[0,...])│
+                              │  GENERATING → 模型继续生成                      │
+                              │     ↓  ...多轮循环...                           │
+                              │  TERMINATED                                     │
+                              │     ↓                                           │
+                              │  构建 AgentLoopOutput:                          │
+                              │    extra_fields["messages"] = reward_history    │
+                              │    extra_fields["task_unfinished"] = bool       │
+                              └─────────────────────┬───────────────────────────┘
+                                                    │
+                                                    ▼
+                              ┌─────────────────────────────────────────────────┐
+                              │        NaiveRewardManager.run_single()           │
+                              │                                                 │
+                              │  extra_info = parquet.extra_info                 │
+                              │              + tool_extra_fields (messages等)    │
+                              │                                                 │
+                              │  compute_score(data_source, solution_str,        │
+                              │               ground_truth, extra_info)          │
+                              │     ↓                                           │
+                              │  carr_reward.py:                                │
+                              │    构建 payload → POST /evaluate                │
+                              │     ↓                                           │
+                              │  CaRR Reward Server:                            │
+                              │    get_outcome_reward() → 0 或 1                │
+                              │    get_rubric_reward() → 0~1                    │
+                              │     ↓                                           │
+                              │  返回 {"score", "outcome_reward", "rubric_reward"}│
+                              └─────────────────────┬───────────────────────────┘
+                                                    │
+                                                    ▼
+                              ┌─────────────────────────────────────────────────┐
+                              │          compute_advantage()                     │
+                              │                                                 │
+                              │  adv_estimator="cgrpo"                          │
+                              │     ↓                                           │
+                              │  compute_cgrpo_advantage():                     │
+                              │    1. 读 non_tensor_batch[outcome/rubric_reward]│
+                              │    2. 按 uid 分组，组内 rubric max 归一化       │
+                              │    3. R = (1-α)*outcome + α*outcome*norm_rubric │
+                              │    4. 替换 token_level_rewards                  │
+                              │    5. 调用 GRPO 组内归一化                      │
+                              │     ↓                                           │
+                              │  得到 advantages → PPO/GRPO policy update       │
+                              └─────────────────────────────────────────────────┘
+```
+
+### 2. 核心格式转换点
+
+整个流程中有两个关键的格式转换：
+
+**转换 1：verl 消息 → CaRR reward history**
+
+verl ToolAgentLoop 产生的消息格式：
+```python
+{"role": "tool", "content": "文本", "tool_call_id": "call_0"}
+```
+
+CaRR reward server 需要的格式：
+```python
+{"role": "tool", "content": [{"tool_call_id": "call_0", "output": "文本"}]}
+```
+
+以及 assistant 消息中 tool_calls：
+```python
+# verl 格式 (Qwen3 chat template)
+{"type": "function", "id": "call_0", "function": {"name": "browser.search", "arguments": "{...}"}}
+
+# CaRR 格式
+{"tool_call_id": "call_0", "name": "browser.search", "arguments": "{...}"}
+```
+
+这个转换在 CaRRToolAgentLoop 中完成。
+
+**转换 2：CaRR SFT 数据 → Qwen3 tokenizer 格式**
+
+方向相反，在数据预处理脚本中完成（见第七部分表格）。
+
+### 3. 关键配置汇总
+
+| 配置项 | 值 | 说明 |
+|--------|-----|------|
+| `algorithm.adv_estimator` | `cgrpo` | 使用 C-GRPO advantage |
+| `algorithm.cgrpo_alpha` | `0.3` | CaRR 论文最优值 |
+| `actor_rollout_ref.rollout.n` | `16` | 每个问题采样 16 次 (GRPO 分组大小) |
+| `actor_rollout_ref.rollout.multi_turn.max_assistant_turns` | `30` | 最大 assistant 轮次 |
+| `actor_rollout_ref.rollout.multi_turn.max_tool_response_length` | `10000` | 工具响应截断长度 |
+| `actor_rollout_ref.rollout.agent.default_agent_loop` | `carr_tool_agent` | 默认 AgentLoop |
+| `reward.custom_reward_function.path` | `.../carr_reward.py` | 自定义 reward 函数 |
+| `VERL_USE_EXTERNAL_MODULES` | `...carr_agent_loop,...cgrpo_advantage` | 外部模块导入 |
+| `CARR_REWARD_SERVER_URL` | `http://localhost:8888` | 奖励服务器地址 |
+
+---
+
+## 附录：关键源码快速索引
+
+| 概念 | 文件 | 关键行/函数 |
+|------|------|------------|
+| CaRR 工具服务器入口 | `CaRR/tool_server/launch_server.py` | `call_tool()` |
+| 防作弊 13-gram 匹配 | `CaRR/tool_server/web_search.py` | `contain_forbidden_str()` |
+| CaRR 奖励服务器入口 | `CaRR/deepsearch_rm_with_rubrics/launch_server.py` | `/evaluate` 端点 |
+| 引文内容提取 | 同上 | `extract_citation_content()` |
+| BFS 连通性检查 | 同上 | `get_rubric_reward()` Step 3 |
+| BaseTool 生命周期 | `verl/tools/base_tool.py` | `create/execute/calc_reward/release` |
+| ToolResponse 定义 | `verl/tools/schemas.py` | `class ToolResponse` |
+| 工具加载 | `verl/tools/utils/tool_registry.py` | `initialize_tools_from_config()` |
+| AgentLoop 注册 | `verl/experimental/agent_loop/agent_loop.py` | `register()` 装饰器 |
+| AgentLoop 状态机 | `verl/experimental/agent_loop/tool_agent_loop.py` | `ToolAgentLoop.run()` |
+| 工具调用(create/exec/release) | 同上 | `_call_tool()` |
+| response_mask 设置 | 同上 | `_handle_generating_state` (mask=1), `_handle_processing_tools_state` (mask=0) |
+| Reward 函数加载 | `verl/trainer/ppo/reward.py` | `get_custom_reward_fn()` |
+| NaiveRewardManager | `verl/experimental/reward_loop/reward_manager/naive.py` | `run_single()` |
+| Advantage 注册 | `verl/trainer/ppo/core_algos.py` | `register_adv_est()` |
+| GRPO advantage | 同上 | `compute_grpo_outcome_advantage()` |
+| compute_advantage 入口 | `verl/trainer/ppo/ray_trainer.py` | `compute_advantage()` |
+| non_tensor_batch 自动传入 | 同上 | `inspect.signature()` 检查 |
+| RL 数据格式参考 | `examples/data_preprocess/gsm8k_tool_agent_loop.py` | `process_fn()` |
+| SFT 数据格式参考 | `examples/data_preprocess/gsm8k_multiturn_sft.py` | `process_fn()` |

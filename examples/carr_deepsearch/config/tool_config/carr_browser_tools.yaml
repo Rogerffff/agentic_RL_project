@@ -1,0 +1,62 @@
+# CaRR browser tools configuration for deep search agent.
+#
+# Three tools (search, open, find) all use the same CaRRBrowserTool class,
+# differentiated by the tool_schema.function.name field.
+#
+# Note: browser.open.id uses type "string" because verl's OpenAIFunctionPropertySchema
+# does not support oneOf. The CaRRBrowserTool.execute() converts to int when needed.
+
+tools:
+  - class_name: "examples.carr_deepsearch.tools.carr_browser_tool.CaRRBrowserTool"
+    config:
+      type: native
+      tool_server_url: "http://localhost:7230"
+    tool_schema:
+      type: "function"
+      function:
+        name: "browser.search"
+        description: "Search the web for information"
+        parameters:
+          type: "object"
+          properties:
+            query:
+              type: "string"
+              description: "Search query"
+            num:
+              type: "integer"
+              description: "Number of results to return"
+          required: ["query"]
+
+  - class_name: "examples.carr_deepsearch.tools.carr_browser_tool.CaRRBrowserTool"
+    config:
+      type: native
+      tool_server_url: "http://localhost:7230"
+    tool_schema:
+      type: "function"
+      function:
+        name: "browser.open"
+        description: "Open a webpage by search result ID or URL"
+        parameters:
+          type: "object"
+          properties:
+            id:
+              type: "string"
+              description: "ID (integer as string) or URL"
+          required: ["id"]
+
+  - class_name: "examples.carr_deepsearch.tools.carr_browser_tool.CaRRBrowserTool"
+    config:
+      type: native
+      tool_server_url: "http://localhost:7230"
+    tool_schema:
+      type: "function"
+      function:
+        name: "browser.find"
+        description: "Find a pattern in the currently opened webpage"
+        parameters:
+          type: "object"
+          properties:
+            pattern:
+              type: "string"
+              description: "Pattern to search for"
+          required: ["pattern"]
