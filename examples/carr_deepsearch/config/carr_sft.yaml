@@ -28,6 +28,7 @@ data:
     messages_key: messages
     tools_key: tools
     enable_thinking_key: enable_thinking
+    truncation: right
 
 # fsdp_sft_trainer reads top-level use_remove_padding
 use_remove_padding: true
