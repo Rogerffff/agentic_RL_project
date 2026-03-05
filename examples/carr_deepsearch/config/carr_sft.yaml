@@ -22,6 +22,7 @@ data:
   max_length: 65536
   train_batch_size: 4
   micro_batch_size_per_gpu: 1
+  ignore_input_ids_mismatch: true
   multiturn:
     enable: true
     messages_key: messages
