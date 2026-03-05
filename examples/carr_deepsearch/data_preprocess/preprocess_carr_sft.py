@@ -74,15 +74,27 @@ def convert_message(msg: dict) -> dict:
     return converted
 
 
+def _sort_keys_recursive(obj):
+    """Recursively sort dict keys to match pyarrow's alphabetical struct field ordering."""
+    if isinstance(obj, dict):
+        return {k: _sort_keys_recursive(v) for k, v in sorted(obj.items())}
+    if isinstance(obj, list):
+        return [_sort_keys_recursive(v) for v in obj]
+    return obj
+
+
 def load_canonical_tools(tool_config_path: str) -> list:
     """Load canonical tool schemas from the YAML config used by RL rollout.
 
     This ensures SFT training and RL rollout see identical tool schemas
     in the system prompt rendered by apply_chat_template.
+
+    Keys are sorted alphabetically at all levels to match pyarrow's struct
+    field ordering after parquet round-trip.
     """
     with open(tool_config_path) as f:
         cfg = yaml.safe_load(f)
-    return [t["tool_schema"] for t in cfg["tools"]]
+    return [_sort_keys_recursive(t["tool_schema"]) for t in cfg["tools"]]
 
 
 def convert_record(record: dict, canonical_tools: list, tokenizer=None) -> Optional[dict]:
