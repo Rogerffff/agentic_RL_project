@@ -52,6 +52,25 @@ class OpenAIFunctionToolSchema(BaseModel):
     function: OpenAIFunctionSchema
 
 
+def normalize_tool_schema(schema):
+    """Normalize a tool schema dict for consistent rendering by apply_chat_template.
+
+    Ensures SFT training (parquet round-trip) and RL rollout (pydantic model_dump)
+    produce identical JSON when rendered in the system prompt.
+
+    Two normalizations:
+    1. Drop None values — pyarrow struct unions add None for missing fields
+       (e.g., browser.search gets pattern=None from browser.find's schema).
+    2. Sort dict keys alphabetically — pyarrow sorts struct field names
+       alphabetically, while pydantic model_dump uses field definition order.
+    """
+    if isinstance(schema, dict):
+        return {k: normalize_tool_schema(v) for k, v in sorted(schema.items()) if v is not None}
+    if isinstance(schema, list):
+        return [normalize_tool_schema(item) for item in schema]
+    return schema
+
+
 class OpenAIFunctionParsedSchema(BaseModel):
     """The parsed schema of a tool in OpenAI format."""
 

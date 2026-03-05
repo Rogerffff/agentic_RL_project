@@ -31,6 +31,7 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from verl.models.transformers.qwen2_vl import get_rope_index
+from verl.tools.schemas import normalize_tool_schema
 from verl.utils import hf_tokenizer
 from verl.utils.chat_template import extract_system_prompt_and_generation
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -177,7 +178,13 @@ class MultiTurnSFTDataset(Dataset):
 
         # Extract tools list from dataframe
         if self.tools_key in self.dataframe.columns:
-            self.tools = self.dataframe[self.tools_key].apply(convert_nested_value_to_list_recursive).tolist()
+            raw_tools = self.dataframe[self.tools_key].apply(convert_nested_value_to_list_recursive).tolist()
+            # Normalize tool schemas: drop None values (pyarrow struct union artifacts)
+            # and sort keys alphabetically for consistent rendering by apply_chat_template.
+            self.tools = [
+                [normalize_tool_schema(t) for t in tools] if isinstance(tools, list) else tools
+                for tools in raw_tools
+            ]
         else:
             self.tools = None
         # Extract enable_thinking list from dataframe
