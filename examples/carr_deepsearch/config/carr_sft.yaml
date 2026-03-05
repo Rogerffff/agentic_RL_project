@@ -23,12 +23,12 @@ data:
   train_batch_size: 4
   micro_batch_size_per_gpu: 1
   ignore_input_ids_mismatch: true
+  truncation: right
   multiturn:
     enable: true
     messages_key: messages
     tools_key: tools
     enable_thinking_key: enable_thinking
-    truncation: right
 
 # fsdp_sft_trainer reads top-level use_remove_padding
 use_remove_padding: true
