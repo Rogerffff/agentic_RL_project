@@ -152,12 +152,18 @@ class ServerAdapter(BaseRollout):
             f"server address: {server_address}, port: {server_port}"
         )
         host = f"[{server_address}]" if is_valid_ipv6_address(server_address) else server_address
+        engine_kwargs = self.config.get("engine_kwargs", {}).get("sglang", {}) or {}
+        attention_backend = engine_kwargs.get("attention_backend", None)
+        adapter_kwargs = {}
+        if attention_backend is not None:
+            adapter_kwargs["attention_backend"] = attention_backend
         self._engine = AsyncHttpServerAdapter(
             model_path=self.model_config.local_path,
             host=host,
             port=server_port,
             launch_server=False,
             trust_remote_code=self.model_config.trust_remote_code,
+            **adapter_kwargs,
         )
 
     async def resume(self, tags: list[str]):
