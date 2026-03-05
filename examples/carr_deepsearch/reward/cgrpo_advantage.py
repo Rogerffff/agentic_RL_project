@@ -97,7 +97,11 @@ def compute_cgrpo_advantage(
                 norm_rubric[ids] = rubric[ids] / max_r
 
         # C-GRPO fusion: R = (1-alpha)*outcome + alpha*outcome*norm_rubric
-        cgrpo_rewards = (1 - alpha) * outcome + alpha * outcome * norm_rubric
+        cgrpo_rewards = torch.tensor(
+            (1 - alpha) * outcome + alpha * outcome * norm_rubric,
+            dtype=token_level_rewards.dtype,
+            device=token_level_rewards.device,
+        )
 
         # Place fused reward at last valid token position
         new_rewards = torch.zeros_like(token_level_rewards)
