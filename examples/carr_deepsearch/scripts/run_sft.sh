@@ -14,7 +14,8 @@ if [ ! -f "$DATA_DIR/sft_train.parquet" ]; then
         --seed 42
 fi
 
-torchrun --nnodes=1 --nproc_per_node=8 \
+NGPUS="${NGPUS:-8}"
+torchrun --nnodes=1 --nproc_per_node="$NGPUS" \
     -m verl.trainer.fsdp_sft_trainer \
     --config-path="$PROJECT_DIR/examples/carr_deepsearch/config" \
     --config-name='carr_sft' \

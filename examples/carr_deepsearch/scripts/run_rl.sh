@@ -4,7 +4,9 @@ set -euxo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$PROJECT_DIR"
 
-: "${SERPAPI_API_KEY:?Must set SERPAPI_API_KEY}"
+if [ -z "${SERPER_API_KEY:-}" ] && [ -z "${SERPAPI_API_KEY:-}" ]; then
+    echo "ERROR: Must set SERPER_API_KEY or SERPAPI_API_KEY" >&2; exit 1
+fi
 : "${JINA_API_KEY:?Must set JINA_API_KEY}"
 : "${DEEPSEEK_API_KEY:?Must set DEEPSEEK_API_KEY}"
 
@@ -13,9 +15,11 @@ export CARR_REWARD_SERVER_URL="http://localhost:8888"
 export CARR_REWARD_TIMEOUT="650"
 
 # Resolve SFT checkpoint path dynamically
-SFT_CKPT_ROOT="$HOME/checkpoints/carr_deepsearch_sft"
-LATEST_STEP=$(cat "$SFT_CKPT_ROOT/latest_checkpointed_iteration.txt")
-export SFT_MODEL_PATH="$SFT_CKPT_ROOT/global_step_${LATEST_STEP}/huggingface"
+if [ -z "${SFT_MODEL_PATH:-}" ]; then
+    SFT_CKPT_ROOT="$HOME/checkpoints/carr_deepsearch_sft"
+    LATEST_STEP=$(cat "$SFT_CKPT_ROOT/latest_checkpointed_iteration.txt")
+    export SFT_MODEL_PATH="$SFT_CKPT_ROOT/global_step_${LATEST_STEP}/huggingface"
+fi
 echo "Using SFT model from: $SFT_MODEL_PATH"
 
 DATA_DIR="$PROJECT_DIR/examples/carr_deepsearch/data"
@@ -39,8 +43,13 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Starting CaRR tool server on port 7230..."
+if [ -n "${SERPER_API_KEY:-}" ]; then
+    SEARCH_ARGS="--search_backend serper --serper_api_key $SERPER_API_KEY"
+else
+    SEARCH_ARGS="--serp_api_key $SERPAPI_API_KEY"
+fi
 python CaRR/tool_server/launch_server.py \
-    --serp_api_key "$SERPAPI_API_KEY" \
+    $SEARCH_ARGS \
     --jina_api_key "$JINA_API_KEY" \
     --port 7230 &
 PIDS+=($!)

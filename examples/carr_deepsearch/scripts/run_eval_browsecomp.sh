@@ -12,8 +12,11 @@ cd "$PROJECT_DIR"
 MODEL_PATH="${1:?Usage: run_eval_browsecomp.sh <model_path> [max_samples] [context]}"
 MAX_SAMPLES="${2:--1}"
 CONTEXT="${3:-64k}"
+shift 3 2>/dev/null || true
 
-: "${SERPAPI_API_KEY:?Must set SERPAPI_API_KEY}"
+if [ -z "${SERPER_API_KEY:-}" ] && [ -z "${SERPAPI_API_KEY:-}" ]; then
+    echo "ERROR: Must set SERPER_API_KEY or SERPAPI_API_KEY" >&2; exit 1
+fi
 : "${JINA_API_KEY:?Must set JINA_API_KEY}"
 : "${DEEPSEEK_API_KEY:?Must set DEEPSEEK_API_KEY}"
 
@@ -51,8 +54,13 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Starting CaRR tool server on port 7230..."
+if [ -n "${SERPER_API_KEY:-}" ]; then
+    SEARCH_ARGS="--search_backend serper --serper_api_key $SERPER_API_KEY"
+else
+    SEARCH_ARGS="--serp_api_key $SERPAPI_API_KEY"
+fi
 python CaRR/tool_server/launch_server.py \
-    --serp_api_key "$SERPAPI_API_KEY" \
+    $SEARCH_ARGS \
     --jina_api_key "$JINA_API_KEY" \
     --port 7230 &
 PIDS+=($!)

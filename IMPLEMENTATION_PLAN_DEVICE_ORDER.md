@@ -37,9 +37,9 @@
 - 多轮 rollout 的真实 GPU 行为验证
 - SFT / RL 冒烟训练
 
-### Device B: 远程 Linux 单卡 GPU
+### Device BC: 远程 Linux `2 x 5090`（合并联调 + 冒烟）
 
-推荐角色：低成本联调机。
+推荐角色：正式训练前唯一的 GPU 调试阶段。
 
 适合做：
 
@@ -48,24 +48,16 @@
 - 工具服务、奖励服务、环境变量、端口联通验证
 - 自定义模块导入验证
 - 单样本或极小 batch 的 rollout 链路验证
+- 小规模 SFT / RL 冒烟
+- BrowseComp subset quick eval
+- `torchrun` / FSDP / rollout / reward 全链路联调
+- OOM 边界、吞吐和关键指标的第一轮确认
 
 不建议把它当作：
 
 - 正式 SFT 训练机
 - 正式 RL 训练机
-- 长上下文、多 rollout 的稳定性验证机
-
-### Device C: 远程 Linux 2-4 卡 GPU
-
-推荐角色：训练前的真正冒烟机。
-
-适合做：
-
-- 小规模 SFT 冒烟
-- 小规模 RL 冒烟
-- BrowseComp subset quick eval
-- `torchrun` / FSDP / rollout / reward 全链路联调
-- OOM 边界、吞吐和关键指标的第一轮确认
+- 正式 benchmark 结论机器
 
 ### Device D: 远程 Linux 8 卡 GPU
 
@@ -85,15 +77,14 @@
 默认策略：
 
 1. 先在 Device A 完成大部分代码编写。
-2. 在 Agent Loop、Tool、Reward 三者首次串起来之后，尽早切到 Device B 做一次真实 Linux GPU 联调。
-3. 在 Device C 上完成第一次“能训练且能快速评测”的小规模 SFT / GRPO / C-GRPO 冒烟。
-4. 只有在 Gate 1-5 都通过后，才上 Device D 做正式训练与正式 benchmark 评测。
+2. 代码在 Mac 基本完成后，直接切到 Device BC（`2 x 5090`）一次性完成 Gate 2-5。
+3. 只有在 Gate 1-5 都通过后，才上 Device D 做正式训练与正式 benchmark 评测。
 
 成本原则：
 
 - 不要在还没打通 tool/reward/history 协议前就租 8 卡。
-- 也不要把第一次 GPU 验证拖到所有代码都写完之后。
-- 单卡 GPU 只用于“链路正确性”，不是用于证明训练方案已经可靠。
+- Mac 代码阶段结束后，优先进入同一台 `2 x 5090` 机器完成联调和小规模训练验证。
+- 正式训练前的所有关键问题都应在 Device BC 清零，不要把基础问题带到 8 卡阶段。
 
 ---
 
@@ -110,21 +101,21 @@
 | 6 | Phase 3 | `carr_agent_loop.py` | Device A | Device A | Device A | 不需要 | `reward_history`、`task_unfinished`、tool_call_id、finally close session 逻辑完成 |
 | 7 | Phase 6 / 7 / 7.5.4 | `carr_sft.yaml`、`carr_grpo.yaml`、`run_sft.sh`、`run_rl.sh`、`run_eval_browsecomp.sh`、`smoke_test.py` | Device A | Device A | Device A | 不需要 | 配置、训练脚本与评测脚本接口一致 |
 | 8 | Gate 1 | 数据 Gate | Device A | Device A | Device A | 不需要 | 数据预处理通过，样本抽检通过 |
-| 9 | Phase 8.0 / 8.2 | Linux GPU 环境打底 | Device A | Device B | Device B | 需要单卡 | `verl`、`sglang`、自定义模块、依赖安装成功 |
-| 10 | Phase 8.2 | Tool / Reward Server 联通 | Device A 或 B | Device B | Device B | 单卡可选 | `smoke_test.py --tool`、`--reward`、`--all` 通过 |
-| 11 | Phase 3 / 4 联调 | 单样本 agent rollout 链路 | Device A 或 B | Device B | Device B | 需要单卡 | 能真实走一轮 `generate -> tool -> reward payload`，且 history 格式正确 |
-| 12 | Gate 2 / 3 | 工具链路 Gate、奖励 Gate | Device A 或 B | Device B | Device B | 需要单卡 | `search -> open -> find` 正常；reward 非格式性全零 |
-| 13 | Phase 8.3 | SFT 微型冒烟 | Device A 或 B | Device C | Device C | 需要 2-4 卡 | 至少跑通 1 个 epoch 或最少若干 step，无 tokenizer/loader/FSDP 崩溃 |
-| 14 | Phase 8.4 | BrowseComp 快速评测冒烟（SFT ckpt） | Device A 或 B | Device C | Device C | 需要 2-4 卡 | `run_eval_browsecomp.sh` 在 `max_samples=5/20` 下可完成 |
-| 15 | Phase 8.5 / 8.6 | GRPO baseline 微型冒烟与快速评测 | Device A 或 B | Device C | Device C | 需要 2-4 卡 | `algorithm.adv_estimator=grpo` 路线可跑通，且输出 `val-core/browsecomp/reward/mean@1` |
-| 16 | Phase 8.7 / 8.8 | C-GRPO 微型冒烟与快速评测 | Device A 或 B | Device C | Device C | 需要 2-4 卡 | C-GRPO 小规模训练与 subset eval 都可完成 |
-| 17 | Gate 4 / 5 | 小规模训练与快速评测 Gate | Device A 或 B | Device C | Device C | 需要 2-4 卡 | `SFT / GRPO / C-GRPO` 路线都至少有一次 subset eval 结果 |
-| 18 | Phase 8.3 正式版 | 完整 SFT | Device A 或 B | Device D | Device D | 需要 8 卡 | SFT checkpoint 可用 |
-| 19 | Phase 8.4 / 8.9 | SFT 正式 BrowseComp 评测 | Device A 或 B | Device D | Device D | 需要 8 卡 | SFT 的 64k 正式 benchmark 数字产出 |
-| 20 | Phase 8.5 正式版 | 完整 GRPO baseline | Device A 或 B | Device D | Device D | 需要 8 卡 | GRPO checkpoint 可用 |
-| 21 | Phase 8.6 / 8.9 | GRPO 正式 BrowseComp 评测 | Device A 或 B | Device D | Device D | 需要 8 卡 | GRPO 的 64k 正式 benchmark 数字产出 |
-| 22 | Phase 8.7 正式版 | 完整 C-GRPO | Device A 或 B | Device D | Device D | 需要 8 卡 | C-GRPO checkpoint 可用 |
-| 23 | Phase 8.8 / 8.9 | C-GRPO 正式 BrowseComp 评测 | Device A 或 B | Device D | Device D | 需要 8 卡 | C-GRPO 的 64k 正式 benchmark 数字产出 |
+| 9 | Phase 8.0 / 8.2 | Linux GPU 环境打底 | Device A | Device BC | Device BC | 需要 `2 x 5090` | `verl`、`sglang`、自定义模块、依赖安装成功 |
+| 10 | Phase 8.2 | Tool / Reward Server 联通 | Device A 或 BC | Device BC | Device BC | 需要 `2 x 5090` | `smoke_test.py --tool`、`--reward`、`--all` 通过 |
+| 11 | Phase 3 / 4 联调 | 单样本 agent rollout 链路 | Device A 或 BC | Device BC | Device BC | 需要 `2 x 5090` | 能真实走一轮 `generate -> tool -> reward payload`，且 history 格式正确 |
+| 12 | Gate 2 / 3 | 工具链路 Gate、奖励 Gate | Device A 或 BC | Device BC | Device BC | 需要 `2 x 5090` | `search -> open -> find` 正常；reward 非格式性全零 |
+| 13 | Phase 8.3 | SFT 微型冒烟 | Device A 或 BC | Device BC | Device BC | 需要 `2 x 5090` | 至少跑通 1 个 epoch 或最少若干 step，无 tokenizer/loader/FSDP 崩溃 |
+| 14 | Phase 8.4 | BrowseComp 快速评测冒烟（SFT ckpt） | Device A 或 BC | Device BC | Device BC | 需要 `2 x 5090` | `run_eval_browsecomp.sh` 在 `max_samples=5/20` 下可完成 |
+| 15 | Phase 8.5 / 8.6 | GRPO baseline 微型冒烟与快速评测 | Device A 或 BC | Device BC | Device BC | 需要 `2 x 5090` | `algorithm.adv_estimator=grpo` 路线可跑通，且输出 `val-core/browsecomp/reward/mean@1` |
+| 16 | Phase 8.7 / 8.8 | C-GRPO 微型冒烟与快速评测 | Device A 或 BC | Device BC | Device BC | 需要 `2 x 5090` | C-GRPO 小规模训练与 subset eval 都可完成 |
+| 17 | Gate 4 / 5 | 小规模训练与快速评测 Gate | Device A 或 BC | Device BC | Device BC | 需要 `2 x 5090` | `SFT / GRPO / C-GRPO` 路线都至少有一次 subset eval 结果 |
+| 18 | Phase 8.3 正式版 | 完整 SFT | Device A 或 BC | Device D | Device D | 需要 8 卡 | SFT checkpoint 可用 |
+| 19 | Phase 8.4 / 8.9 | SFT 正式 BrowseComp 评测 | Device A 或 BC | Device D | Device D | 需要 8 卡 | SFT 的 64k 正式 benchmark 数字产出 |
+| 20 | Phase 8.5 正式版 | 完整 GRPO baseline | Device A 或 BC | Device D | Device D | 需要 8 卡 | GRPO checkpoint 可用 |
+| 21 | Phase 8.6 / 8.9 | GRPO 正式 BrowseComp 评测 | Device A 或 BC | Device D | Device D | 需要 8 卡 | GRPO 的 64k 正式 benchmark 数字产出 |
+| 22 | Phase 8.7 正式版 | 完整 C-GRPO | Device A 或 BC | Device D | Device D | 需要 8 卡 | C-GRPO checkpoint 可用 |
+| 23 | Phase 8.8 / 8.9 | C-GRPO 正式 BrowseComp 评测 | Device A 或 BC | Device D | Device D | 需要 8 卡 | C-GRPO 的 64k 正式 benchmark 数字产出 |
 | 24 | Phase 8.10 | 结果汇总与简历指标整理 | Device A | Device A | Device A | 不需要 | 三模型对比表完成 |
 
 ---
@@ -147,11 +138,11 @@
 
 如果在这一段就依赖远程 GPU，成本高，而且容易把简单问题拖成环境问题。
 
-### Step 9-12: 第一次远程 GPU 联调，优先使用单卡 Linux
+### Step 9-17: 使用同一台 `2 x 5090` 完成联调 + 小规模训练验证
 
-这一步建议尽早做，不要等全部代码结束。
+这一步是 Mac 开发完成后的唯一预正式训练阶段，建议一次租机连续跑完。
 
-重点验证：
+先做联调（旧 Step 9-12）：
 
 - 依赖是否能在 Linux + CUDA 环境中装起来
 - `VERL_USE_EXTERNAL_MODULES` 是否能正确加载你的自定义模块
@@ -159,15 +150,7 @@
 - `smoke_test.py` 是否真的通过
 - 单样本 history 格式是否能让 CaRR reward server 接受
 
-这一段的目标不是训练收敛，而是证明“系统已经活了”。
-
-如果你手头只有类似单张消费级高显存卡，它可以用于这一步。
-
-### Step 13-17: 第一次真正训练与快速评测冒烟，使用 2-4 卡 Linux
-
-这一段不要再用 Mac，也不要继续坚持单卡。
-
-推荐动作：
+再做小规模训练与 quick eval（旧 Step 13-17）：
 
 - SFT:
   - 减小 `train_batch_size`
@@ -182,7 +165,7 @@
   - 缩短 `max_response_length`
   - 先跑 `trainer.total_epochs=1`
 
-这一步要验证的是：
+这一段要一次性确认：
 
 - FSDP / `torchrun` 是否正常
 - rollout 是否能稳定结束
@@ -220,10 +203,10 @@
 | Gate | 说明 | 必须在哪类设备完成 |
 |---|---|---|
 | Gate 1 | 数据预处理通过 | Device A |
-| Gate 2 | 工具链路通过 | Device B |
-| Gate 3 | 奖励链路通过 | Device B |
-| Gate 4 | 小规模 RL 通过 | Device C |
-| Gate 5 | 小规模训练与快速评测通过 | Device C |
+| Gate 2 | 工具链路通过 | Device BC |
+| Gate 3 | 奖励链路通过 | Device BC |
+| Gate 4 | 小规模 RL 通过 | Device BC |
+| Gate 5 | 小规模训练与快速评测通过 | Device BC |
 | Gate 6 | 正式 BrowseComp 评测完成 | Device D |
 | Gate 7 | `SFT / GRPO / C-GRPO` 三模型正式结果表完成 | Device D + Device A |
 
@@ -250,31 +233,23 @@
 - 代码基本完成
 - 至少能静态确认所有接口拼得上
 
-### 阶段 B: 低成本 Linux 联调
+### 阶段 BC: `2 x 5090` 联调 + 小规模训练验证（合并阶段）
 
-切到 Device B，优先做：
+切到 Device BC，一次连续完成：
 
 1. 环境安装
 2. Tool / Reward 服务启动
 3. `smoke_test.py`
 4. 单样本 rollout
+5. SFT 微型冒烟
+6. BrowseComp quick eval 冒烟
+7. GRPO baseline 微型冒烟
+8. C-GRPO 微型冒烟
+9. 观察 reward、turn 数、aborted ratio、BrowseComp subset accuracy
 
 产出：
 
 - 确认代码不是“只在本地看起来正确”
-
-### 阶段 C: 小规模训练验证
-
-切到 Device C，做：
-
-1. SFT 微型冒烟
-2. BrowseComp quick eval 冒烟
-3. GRPO baseline 微型冒烟
-4. C-GRPO 微型冒烟
-5. 观察 reward、turn 数、aborted ratio、BrowseComp subset accuracy
-
-产出：
-
 - 确认方案既具备训练可行性，也具备首版 benchmark 可执行性
 
 ### 阶段 D: 正式训练与正式评测
@@ -291,26 +266,22 @@
 
 ---
 
-## 对“单张 5090 / 单卡高显存机器”的定位
+## 对 `2 x 5090` 合并阶段的定位
 
-在本计划中，它只承担 Device B 的角色：
+在本计划中，`2 x 5090` 同时承担原 Device B + Device C：
 
-- 可以用来验证环境、服务、模块注册、单样本链路
-- 可以用来验证 subset 级别的工具链路
-- 可以用来尽早发现 Linux + CUDA 相关问题
-- 不应作为正式 SFT / RL / BrowseComp 结论的依据
+- 用于 Linux GPU 环境联调、服务联通、模块注册、单样本链路
+- 用于小规模 `SFT / GRPO / C-GRPO` 冒烟与 BrowseComp quick eval
+- 用于在正式训练前定位 OOM、NaN、死锁、协议错误等关键问题
+- 不用于正式 benchmark 数字结论
 
-如果预算紧张，正确顺序是：
+如果预算紧张，推荐顺序是：
 
 1. 先在 Mac 写完大部分代码
-2. 短租单卡做 Linux GPU 联调
-3. 再租 2-4 卡做训练 + quick eval 冒烟
-4. 最后租 8 卡做正式训练与正式评测
+2. 直接租 `2 x 5090`，完成 Gate 2-5
+3. 最后租 8 卡做正式训练与正式评测
 
-而不是：
-
-- 从第一天就租 8 卡写代码
-- 或者一直不碰 GPU，直到所有代码写完才第一次上 8 卡
+如果只能拿到单张卡，它只能承担部分联调任务，不建议作为本计划默认路径。
 
 ---
 
@@ -336,9 +307,8 @@
 最推荐的落地顺序：
 
 1. Device A 完成代码与数据逻辑
-2. Device B 打通 Linux GPU + 服务 + 单样本链路
-3. Device C 完成小规模训练 + quick eval 冒烟
-4. Device D 做正式训练、正式 benchmark 与结果汇总
+2. Device BC（`2 x 5090`）完成联调 + 小规模训练 + quick eval 冒烟
+3. Device D 做正式训练、正式 benchmark 与结果汇总
 
 如果必须压缩成本，优先压缩的是：
 
@@ -346,7 +316,6 @@
 
 不应该压缩的是：
 
-- Device B 的第一次 Linux GPU 联调
-- Device C 的第一次训练与 quick eval 冒烟
+- Device BC 阶段（Gate 2-5）
 
-因为这两步负责把“逻辑问题”和“训练系统问题”提前拆开。
+因为它负责把“逻辑问题”和“训练系统问题”都在正式训练前提前拆开。

@@ -20,7 +20,7 @@ SFT 冷启动（Qwen3-4B）→ C-GRPO RL 训练 → BrowseComp 评测
 |------|------|------|
 | 代码编写（18 个新文件） | ✅ 完成 | 全部文件已编写并通过逐步 code review |
 | 本地 Mac 验证（Gate 1） | ✅ 通过 | 语法/schema/数据预处理/import 全部验证 |
-| GPU 训练验证（Gate ...） | ⏳ 待做 | 需要 2 * 5090(验证)，8×GPU 环境正式训练 |
+| GPU 训练验证（Gate 2-7） | ⏳ 待做 | 正式训练前先在 `2 x 5090` 完成 Gate 2-5，再进入 8 卡正式训练 |
 
 ### 1.3 架构一句话
 
@@ -565,15 +565,17 @@ export VERL_USE_EXTERNAL_MODULES=examples.carr_deepsearch.tools.carr_agent_loop,
 
 ## 八、下一阶段 TODO（按设备分层）
 
-> 完整的设备策略见 `IMPLEMENTATION_PLAN_DEVICE_ORDER.md`。核心原则：**不要在链路没打通前就租 8 卡，也不要把第一次 GPU 验证拖到所有代码写完之后。**
+> 完整的设备策略见 `IMPLEMENTATION_PLAN_DEVICE_ORDER.md`。当前本地 Mac 代码开发已完成，下一步直接进入同一台 `2 x 5090` 机器完成 Gate 2-5。
 
 数据文件已在仓库内（`examples/carr_deepsearch/data/`），config 已指向该路径，无需额外预处理。
 
-### 8.1 阶段 B — 单卡 Linux GPU 联调（Gate 2/3）
+### 8.1 阶段 BC — `2 x 5090` 联调 + 小规模冒烟（Gate 2/3/4/5）
 
-**目标**：证明"系统已经活了"，不是训练收敛。
+**目标**：在正式训练前解决所有关键问题。先证明链路可用，再证明小规模训练和 quick eval 可执行。
 
-**环境搭建**：
+**执行顺序（一次租机连续完成）**：
+
+1. **环境搭建与模块注册**
 ```bash
 pip install -e .[test,sglang]
 # 验证自定义模块能正确注册
@@ -581,14 +583,14 @@ VERL_USE_EXTERNAL_MODULES=examples.carr_deepsearch.tools.carr_agent_loop,example
     python -c "from verl.experimental.agent_loop.agent_loop import _AGENT_LOOP_REGISTRY; print(_AGENT_LOOP_REGISTRY.keys())"
 ```
 
-**服务连通性**：
+2. **服务连通性**
 ```bash
 # 启动 CaRR 工具服务器 + 奖励服务器（需要 SERPAPI / JINA / DEEPSEEK API key）
 # 然后运行：
 python examples/carr_deepsearch/scripts/smoke_test.py --all
 ```
 
-**单样本 rollout 链路**（最关键）：
+3. **单样本 rollout 链路（最关键）**
 - 用极小 batch 跑一次 `main_ppo`，验证 `generate → tool_call → tool_server → reward_server → advantage` 全链路
 - 重点检查：
   - `history` 格式是否被 CaRR reward server 接受（非格式性全零）
@@ -596,7 +598,7 @@ python examples/carr_deepsearch/scripts/smoke_test.py --all
   - `non_tensor_batch` 中是否出现 `outcome_reward` 和 `rubric_reward`
   - `cgrpo` advantage estimator 是否被调用
 
-**待确认项**：SFT parquet 中 tool 消息缺少 `tool_call_id` 字段。如果 Qwen3 tokenizer 报错，需在 `preprocess_carr_sft.py` 的 `convert_message()` 中从前一个 assistant 的 tool_calls 传播。可先运行 `--model_name Qwen/Qwen3-4B` 验证：
+**待确认项（在本阶段尽早排除）**：SFT parquet 中 tool 消息缺少 `tool_call_id` 字段。如果 Qwen3 tokenizer 报错，需在 `preprocess_carr_sft.py` 的 `convert_message()` 中从前一个 assistant 的 tool_calls 传播。可先运行 `--model_name Qwen/Qwen3-4B` 验证：
 ```bash
 python examples/carr_deepsearch/data_preprocess/preprocess_carr_sft.py \
     --input_file CaRR/data/deepdive-sft-glm46-trajectory-1k.jsonl \
@@ -604,11 +606,7 @@ python examples/carr_deepsearch/data_preprocess/preprocess_carr_sft.py \
     --model_name Qwen/Qwen3-4B
 ```
 
-### 8.2 阶段 C — 2~4 卡小规模冒烟（Gate 4/5）
-
-**目标**：验证训练可行性和 benchmark 可执行性，不追求收敛。
-
-**SFT 微型冒烟**：
+4. **SFT 微型冒烟**
 ```bash
 bash examples/carr_deepsearch/scripts/run_sft.sh \
     trainer.n_gpus_per_node=2 \
@@ -617,13 +615,13 @@ bash examples/carr_deepsearch/scripts/run_sft.sh \
     trainer.total_epochs=1
 ```
 
-**BrowseComp 快速评测冒烟**（用 SFT checkpoint）：
+5. **BrowseComp 快速评测冒烟**（用 SFT checkpoint）
 ```bash
 bash examples/carr_deepsearch/scripts/run_eval_browsecomp.sh <sft_ckpt_path> 5 64k \
     trainer.n_gpus_per_node=2
 ```
 
-**GRPO baseline 微型冒烟**：
+6. **GRPO baseline 微型冒烟**
 ```bash
 bash examples/carr_deepsearch/scripts/run_rl.sh \
     algorithm.adv_estimator=grpo \
@@ -634,7 +632,7 @@ bash examples/carr_deepsearch/scripts/run_rl.sh \
     trainer.total_epochs=1
 ```
 
-**C-GRPO 微型冒烟**：
+7. **C-GRPO 微型冒烟**
 ```bash
 bash examples/carr_deepsearch/scripts/run_rl.sh \
     trainer.n_gpus_per_node=2 \
@@ -644,13 +642,14 @@ bash examples/carr_deepsearch/scripts/run_rl.sh \
     trainer.total_epochs=1
 ```
 
-**验证要点**：
+**本阶段退出条件**：
 - FSDP / `torchrun` 是否正常
 - rollout 是否能稳定结束（不死锁、不 OOM）
 - `run_eval_browsecomp.sh` 能否输出 reward 指标
 - 训练 loss 是否在下降（不要求收敛，但不能是 NaN 或常数）
+- Gate 2/3/4/5 全部通过后，才进入 8 卡阶段
 
-### 8.3 阶段 D — 8 卡正式训练与评测（Gate 6/7）
+### 8.2 阶段 D — 8 卡正式训练与评测（Gate 6/7）
 
 > **进入条件**：Gate 1~5 全部通过后才租 8 卡。此时不应再排查 history 格式、tool_call_id 绑定、estimator 注册、shell 路径等低级问题。
 
@@ -680,15 +679,15 @@ bash run_eval_browsecomp.sh <cgrpo_ckpt> -1 64k
 
 **最终产出**：SFT / GRPO / C-GRPO 三模型在 BrowseComp 上的对比表。
 
-### 8.4 Gate 定义速查
+### 8.3 Gate 定义速查
 
 | Gate | 说明 | 设备 | 前置 |
 |------|------|------|------|
 | Gate 1 | 数据预处理通过 | Mac | — |
-| Gate 2 | 工具链路通过（search → open → find） | 单卡 | Gate 1 |
-| Gate 3 | 奖励链路通过（reward 非格式性全零） | 单卡 | Gate 1 |
-| Gate 4 | 小规模 SFT + RL 可跑通 | 2~4 卡 | Gate 2, 3 |
-| Gate 5 | 小规模 BrowseComp eval 可输出指标 | 2~4 卡 | Gate 4 |
+| Gate 2 | 工具链路通过（search → open → find） | `2 x 5090` | Gate 1 |
+| Gate 3 | 奖励链路通过（reward 非格式性全零） | `2 x 5090` | Gate 1 |
+| Gate 4 | 小规模 SFT + RL 可跑通 | `2 x 5090` | Gate 2, 3 |
+| Gate 5 | 小规模 BrowseComp eval 可输出指标 | `2 x 5090` | Gate 4 |
 | Gate 6 | 正式 BrowseComp 评测完成 | 8 卡 | Gate 5 |
 | Gate 7 | 三模型对比表完成 | 8 卡 | Gate 6 |
 

@@ -38,7 +38,7 @@ trainer:
   total_epochs: 3
   project_name: carr_deepsearch_sft
   experiment_name: carr-sft-qwen3-4b
-  logger: ['console', 'wandb']
+  logger: ['console']
   default_local_dir: ${oc.env:HOME}/checkpoints/carr_deepsearch_sft
   save_freq: 1
   test_freq: 1

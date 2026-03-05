@@ -136,6 +136,10 @@ async def test_reward_server(url="http://localhost:8888"):
         assert isinstance(result["rubric_reward"], (int, float)), (
             f"rubric_reward is not numeric: {result['rubric_reward']}"
         )
+        assert result["outcome_reward"] > 0, (
+            f"Expected positive outcome_reward for exact-match test case, got {result['outcome_reward']}. "
+            "Check DEEPSEEK_API_KEY validity."
+        )
         print(f"  outcome_reward: {result['outcome_reward']}")
         print(f"  rubric_reward:  {result['rubric_reward']}")
         print(f"  reward:         {result['reward']}")
