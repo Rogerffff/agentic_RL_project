@@ -19,7 +19,8 @@ Converts CaRR message format to Qwen3 chat template format:
 - tool.content: [{output: text}] -> "text" (plain string)
 - assistant.content: null -> ""
 - reasoning_content: preserved
-- tools: CaRR format -> OpenAI function tools format
+- tools: loaded from canonical YAML config (carr_browser_tools.yaml) to ensure
+  SFT training and RL rollout see identical tool schemas in the system prompt.
 
 Input:  CaRR/data/deepdive-sft-glm46-trajectory-1k.jsonl
 Output: sft_train.parquet, sft_val.parquet
@@ -30,9 +31,11 @@ import json
 import logging
 import os
 import random
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -71,28 +74,28 @@ def convert_message(msg: dict) -> dict:
     return converted
 
 
-def convert_tools(tools: list) -> list:
-    """Convert CaRR tool schema to OpenAI function tools format."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": t["name"],
-                "description": t.get("description", ""),
-                "parameters": t.get("parameters", {}),
-            },
-        }
-        for t in tools
-    ]
+def load_canonical_tools(tool_config_path: str) -> list:
+    """Load canonical tool schemas from the YAML config used by RL rollout.
+
+    This ensures SFT training and RL rollout see identical tool schemas
+    in the system prompt rendered by apply_chat_template.
+    """
+    with open(tool_config_path) as f:
+        cfg = yaml.safe_load(f)
+    return [t["tool_schema"] for t in cfg["tools"]]
 
 
-def convert_record(record: dict, tokenizer=None) -> Optional[dict]:
+def convert_record(record: dict, canonical_tools: list, tokenizer=None) -> Optional[dict]:
     """Convert a single CaRR SFT record to verl parquet format.
+
+    Args:
+        record: Raw CaRR SFT record with messages and tools.
+        canonical_tools: Tool schemas loaded from carr_browser_tools.yaml.
+        tokenizer: Optional tokenizer for validation.
 
     Returns None if the record fails validation.
     """
     messages = record.get("messages", [])
-    tools = record.get("tools", [])
 
     if not messages:
         return None
@@ -100,15 +103,12 @@ def convert_record(record: dict, tokenizer=None) -> Optional[dict]:
     # Convert messages
     converted_messages = [convert_message(m) for m in messages]
 
-    # Convert tools to OpenAI format
-    converted_tools = convert_tools(tools) if tools else []
-
     # Validate with tokenizer if available (enable_thinking=True to match real training)
     if tokenizer is not None:
         try:
             tokenizer.apply_chat_template(
                 converted_messages,
-                tools=converted_tools if converted_tools else None,
+                tools=canonical_tools if canonical_tools else None,
                 enable_thinking=True,
                 tokenize=False,
             )
@@ -118,10 +118,9 @@ def convert_record(record: dict, tokenizer=None) -> Optional[dict]:
 
     result = {
         "messages": converted_messages,
+        "tools": canonical_tools,
         "enable_thinking": True,
     }
-    if converted_tools:
-        result["tools"] = converted_tools
 
     return result
 
@@ -130,6 +129,12 @@ def main():
     parser = argparse.ArgumentParser(description="Preprocess CaRR SFT data to verl parquet format")
     parser.add_argument("--input_file", required=True, help="Path to deepdive-sft-glm46-trajectory-1k.jsonl")
     parser.add_argument("--output_dir", required=True, help="Output directory for parquet files")
+    parser.add_argument(
+        "--tool_config",
+        default=None,
+        help="Path to carr_browser_tools.yaml (canonical tool schemas). "
+        "Auto-detected relative to this script if not provided.",
+    )
     parser.add_argument("--val_ratio", type=float, default=0.05, help="Validation split ratio")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for split")
     parser.add_argument(
@@ -140,6 +145,16 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Load canonical tool schemas
+    if args.tool_config is None:
+        args.tool_config = str(
+            Path(__file__).resolve().parent.parent / "config" / "tool_config" / "carr_browser_tools.yaml"
+        )
+    canonical_tools = load_canonical_tools(args.tool_config)
+    print(f"Loaded {len(canonical_tools)} canonical tools from {args.tool_config}")
+    for t in canonical_tools:
+        print(f"  - {t['function']['name']}")
 
     # Load tokenizer if specified
     tokenizer = None
@@ -163,7 +178,7 @@ def main():
     converted = []
     skipped = 0
     for i, record in enumerate(raw_records):
-        result = convert_record(record, tokenizer=tokenizer)
+        result = convert_record(record, canonical_tools=canonical_tools, tokenizer=tokenizer)
         if result is None:
             skipped += 1
             logger.warning("Skipped record %d", i)
