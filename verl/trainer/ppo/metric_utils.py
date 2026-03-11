@@ -222,6 +222,30 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    # CaRR reward components
+    for key in ["outcome_reward", "rubric_reward"]:
+        if key in batch.non_tensor_batch:
+            vals = batch.non_tensor_batch[key]
+            metrics[f"{key}/min"] = float(np.min(vals))
+            metrics[f"{key}/max"] = float(np.max(vals))
+            metrics[f"{key}/mean"] = float(np.mean(vals))
+
+    # Per-tool-type counts
+    for key in ["search_count", "open_count", "find_count"]:
+        if key in batch.non_tensor_batch:
+            vals = batch.non_tensor_batch[key]
+            metrics[f"{key}/mean"] = float(np.mean(vals))
+
+    # Boolean-like metrics
+    for key in ["task_unfinished", "hit_limit"]:
+        if key in batch.non_tensor_batch:
+            vals = batch.non_tensor_batch[key]
+            metrics[f"{key}/ratio"] = float(np.mean(vals))
+
+    if "parse_error_count" in batch.non_tensor_batch:
+        vals = batch.non_tensor_batch["parse_error_count"]
+        metrics["parse_error_count/mean"] = float(np.mean(vals))
+
     return metrics
 
 

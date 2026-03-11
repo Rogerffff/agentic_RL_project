@@ -54,6 +54,8 @@ def main():
         default=None,
         help="Local path to dataset. If not provided, downloads from HuggingFace.",
     )
+    parser.add_argument("--subset_size", type=int, default=256, help="Subset size for fixed eval (0 to skip)")
+    parser.add_argument("--subset_seed", type=int, default=42, help="Random seed for subset sampling")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -127,6 +129,14 @@ def main():
     assert sample_prompt.endswith(FORMAT_SUFFIX.strip()), "prompt should end with FORMAT_SUFFIX"
     assert not sample_forbidden.endswith(FORMAT_SUFFIX.strip()), "search_forbidden_strs should NOT have FORMAT_SUFFIX"
     print(f"  prompt vs forbidden: prompt is longer by {len(sample_prompt) - len(sample_forbidden)} chars (FORMAT_SUFFIX)")
+
+    # Generate fixed subset for reproducible evaluation
+    if args.subset_size > 0 and args.subset_size < len(df):
+        subset_df = df.sample(n=args.subset_size, random_state=args.subset_seed)
+        subset_filename = f"browsecomp_eval_subset_{args.subset_size}_seed{args.subset_seed}.parquet"
+        subset_path = os.path.join(args.output_dir, subset_filename)
+        subset_df.to_parquet(subset_path)
+        print(f"\nSaved subset: {subset_path} ({len(subset_df)} rows)")
 
 
 if __name__ == "__main__":

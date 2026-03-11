@@ -43,6 +43,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -113,6 +114,11 @@ class CaRRToolAgentLoop(ToolAgentLoop):
         pending_tool_calls = []
         turn_idx = 0
         hit_limit = False  # True if terminated by response_length / max_turns limit
+        total_tool_calls = 0
+        search_count = 0
+        open_count = 0
+        find_count = 0
+        parse_error_count = 0
 
         try:
             state = AgentState.PENDING
@@ -164,7 +170,23 @@ class CaRRToolAgentLoop(ToolAgentLoop):
                             "content": assistant_text,
                         })
 
+                    # Count parse errors: complete blocks that failed JSON parse + truncated blocks
+                    complete_blocks = len(re.findall(r"<tool_call>.*?</tool_call>", assistant_text, re.DOTALL))
+                    incomplete_blocks = assistant_text.count("<tool_call>") - complete_blocks
+                    parse_error_count += max(0, complete_blocks - len(agent_data.tool_calls)) + incomplete_blocks
+
                 elif state == AgentState.PROCESSING_TOOLS:
+                    # Count ACTUALLY EXECUTED tool calls (after max_parallel_calls slice)
+                    executed = agent_data.tool_calls[:self.max_parallel_calls]
+                    total_tool_calls += len(executed)
+                    for tc in executed:
+                        if tc.name == "browser.search":
+                            search_count += 1
+                        elif tc.name == "browser.open":
+                            open_count += 1
+                        elif tc.name == "browser.find":
+                            find_count += 1
+
                     prev_state_len = len(agent_data.response_mask)
                     state = await self._handle_processing_tools_state_with_history(
                         agent_data, reward_history, pending_tool_calls,
@@ -223,6 +245,12 @@ class CaRRToolAgentLoop(ToolAgentLoop):
             "tool_rewards": agent_data.tool_rewards,
             "messages": reward_history,
             "task_unfinished": task_unfinished,
+            "tool_call_counts": total_tool_calls,
+            "search_count": search_count,
+            "open_count": open_count,
+            "find_count": find_count,
+            "hit_limit": hit_limit,
+            "parse_error_count": parse_error_count,
         })
         return output
 

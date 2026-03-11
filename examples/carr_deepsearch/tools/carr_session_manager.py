@@ -23,6 +23,7 @@ cannot be tied to individual tool instances. Instead, the session is managed
 at the request level and closed in the agent loop's finally block.
 """
 
+import asyncio
 import logging
 from typing import Any, Dict, Set, Tuple
 
@@ -39,6 +40,7 @@ class CaRRSessionManager:
     def __init__(self):
         self._started_sessions: Set[str] = set()
         self._session_data: Dict[str, Dict[str, Any]] = {}
+        self._http_sessions: Dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = {}
 
     @classmethod
     def get_instance(cls) -> "CaRRSessionManager":
@@ -92,18 +94,27 @@ class CaRRSessionManager:
             "remote_env_info": remote_env_info,
         }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=60),
-                ) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        logger.error("Tool server HTTP %s: %s", resp.status, error_text[:200])
-                        return False, "Tool server HTTP %d" % resp.status
-                    result = await resp.json()
-                    return True, result.get("output", "")
+            session = self._get_http_session()
+            async with session.post(
+                url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error("Tool server HTTP %s: %s", resp.status, error_text[:200])
+                    return False, "Tool server HTTP %d" % resp.status
+                result = await resp.json()
+                return True, result.get("output", "")
         except Exception as e:
             logger.error("Error calling tool server: %s", e)
             return False, "Error calling tool server: %s" % e
+
+    def _get_http_session(self) -> aiohttp.ClientSession:
+        loop = asyncio.get_running_loop()
+        session = self._http_sessions.get(loop)
+        if session is None or session.closed:
+            connector = aiohttp.TCPConnector(limit=512, keepalive_timeout=30, ttl_dns_cache=300)
+            session = aiohttp.ClientSession(connector=connector)
+            self._http_sessions[loop] = session
+        return session

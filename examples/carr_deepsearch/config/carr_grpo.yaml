@@ -16,7 +16,8 @@ data:
   return_raw_chat: true
   max_prompt_length: 4096
   max_response_length: 61440
-  train_batch_size: 128
+  train_batch_size: 16
+  val_batch_size: 16
 
 actor_rollout_ref:
   hybrid_engine: true
@@ -27,6 +28,8 @@ actor_rollout_ref:
     use_remove_padding: true
   actor:
     strategy: fsdp
+    fsdp_config:
+      model_dtype: bf16
     use_dynamic_bsz: true
     ppo_max_token_len_per_gpu: 24576
     optim:
@@ -38,7 +41,7 @@ actor_rollout_ref:
     mode: async
     temperature: 1.0
     top_p: 1.0
-    n: 16
+    n: 8
     gpu_memory_utilization: 0.5
     multi_turn:
       enable: true
@@ -51,6 +54,8 @@ actor_rollout_ref:
       default_agent_loop: carr_tool_agent
 
   ref:
+    fsdp_config:
+      model_dtype: bf16
     log_prob_micro_batch_size_per_gpu: 2
 
 algorithm:
@@ -70,9 +75,10 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 8
   total_epochs: 3
-  save_freq: 50
-  test_freq: 50
+  save_freq: 99
+  test_freq: 99
   project_name: carr_deepsearch
   experiment_name: carr-cgrpo-qwen3-4b
-  logger: ['console']
+  logger: ['console', 'wandb']
   default_local_dir: ${oc.env:HOME}/checkpoints/carr_deepsearch_rl
+  validation_data_dir: ${oc.env:HOME}/eval_results/carr_deepsearch_rl_val

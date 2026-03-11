@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euxo pipefail
 
+START_TIME=$(date +%s)
+
 PROJECT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$PROJECT_DIR"
 
@@ -20,3 +22,6 @@ torchrun --nnodes=1 --nproc_per_node="$NGPUS" \
     --config-path="$PROJECT_DIR/examples/carr_deepsearch/config" \
     --config-name='carr_sft' \
     "$@"
+
+END_TIME=$(date +%s); ELAPSED=$((END_TIME - START_TIME))
+echo "Completed in ${ELAPSED}s ($(( ELAPSED / 3600 ))h$(( (ELAPSED % 3600) / 60 ))m$(( ELAPSED % 60 ))s)"

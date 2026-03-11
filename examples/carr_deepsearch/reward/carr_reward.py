@@ -23,6 +23,7 @@ Sends history to CaRR reward server /evaluate endpoint and returns
 non_tensor_batch for downstream C-GRPO advantage estimation.
 """
 
+import asyncio
 import logging
 import os
 
@@ -33,6 +34,17 @@ logger = logging.getLogger(__name__)
 REWARD_SERVER_URL = os.environ.get("CARR_REWARD_SERVER_URL", "http://localhost:8888")
 # Must be > server's internal 600s timeout to avoid client-side timeout first
 REWARD_TIMEOUT = int(os.environ.get("CARR_REWARD_TIMEOUT", "650"))
+_HTTP_SESSIONS: dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = {}
+
+
+def _get_http_session() -> aiohttp.ClientSession:
+    loop = asyncio.get_running_loop()
+    session = _HTTP_SESSIONS.get(loop)
+    if session is None or session.closed:
+        connector = aiohttp.TCPConnector(limit=512, keepalive_timeout=30, ttl_dns_cache=300)
+        session = aiohttp.ClientSession(connector=connector)
+        _HTTP_SESSIONS[loop] = session
+    return session
 
 
 async def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
@@ -67,6 +79,17 @@ async def compute_score(data_source, solution_str, ground_truth, extra_info=None
     if messages and messages[-1].get("role") != "assistant":
         task_unfinished = True
 
+    # Pass-through metrics (constructed AFTER task_unfinished override so values are consistent)
+    _pass = {
+        "task_unfinished": float(task_unfinished),
+        "tool_call_counts": float(extra_info.get("tool_call_counts", 0)),
+        "search_count": float(extra_info.get("search_count", 0)),
+        "open_count": float(extra_info.get("open_count", 0)),
+        "find_count": float(extra_info.get("find_count", 0)),
+        "hit_limit": float(extra_info.get("hit_limit", False)),
+        "parse_error_count": float(extra_info.get("parse_error_count", 0)),
+    }
+
     payload = {
         "history": messages,
         "label": ground_truth,
@@ -79,20 +102,20 @@ async def compute_score(data_source, solution_str, ground_truth, extra_info=None
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{REWARD_SERVER_URL}/evaluate",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=REWARD_TIMEOUT),
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.error("Reward server HTTP %s: %s", resp.status, error_text[:200])
-                    return {"score": 0.0, "outcome_reward": 0.0, "rubric_reward": 0.0}
-                result = await resp.json()
+        session = _get_http_session()
+        async with session.post(
+            f"{REWARD_SERVER_URL}/evaluate",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=REWARD_TIMEOUT),
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                logger.error("Reward server HTTP %s: %s", resp.status, error_text[:200])
+                return {"score": 0.0, "outcome_reward": 0.0, "rubric_reward": 0.0, **_pass}
+            result = await resp.json()
     except Exception as e:
         logger.error("Reward server call failed: %s", e)
-        return {"score": 0.0, "outcome_reward": 0.0, "rubric_reward": 0.0}
+        return {"score": 0.0, "outcome_reward": 0.0, "rubric_reward": 0.0, **_pass}
 
     outcome_reward = float(result.get("outcome_reward", 0.0))
     rubric_reward = float(result.get("rubric_reward", 0.0))
@@ -102,4 +125,5 @@ async def compute_score(data_source, solution_str, ground_truth, extra_info=None
         "score": outcome_reward,
         "outcome_reward": outcome_reward,
         "rubric_reward": rubric_reward,
+        **_pass,
     }
