@@ -6,6 +6,7 @@ This test checks:
 2. The rendered text contains <tool_call> tags (Hermes format) for browser.search/open/find
 3. The SFT training format matches what the RL rollout tool parser expects
 4. Loss mask covers tool_call tokens (model learns to generate tool calls)
+5. The real MultiTurnSFTDataset training path keeps reasoning/final-answer tokens in the loss mask
 
 Usage:
     python test_sft_tokenization.py --model_path <path_to_qwen3_model_or_checkpoint>
@@ -145,6 +146,39 @@ def test_apply_chat_template(tokenizer, messages, tools, enable_thinking):
     )
 
     return rendered_text, token_ids
+
+
+def inspect_training_path(tokenizer, data_path: str):
+    """Inspect the actual MultiTurnSFTDataset loss-masked text used for training."""
+    from omegaconf import OmegaConf
+
+    from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
+
+    dataset = MultiTurnSFTDataset(
+        parquet_files=data_path,
+        tokenizer=tokenizer,
+        config=OmegaConf.create(
+            {
+                "max_length": 65536,
+                "truncation": "loss_window",
+                "messages_key": "messages",
+                "tools_key": "tools",
+                "enable_thinking_key": "enable_thinking",
+                "ignore_input_ids_mismatch": True,
+            }
+        ),
+        max_samples=1,
+    )
+
+    item = dataset[0]
+    loss_text = tokenizer.decode(item["input_ids"][item["loss_mask"].bool()])
+    return {
+        "loss_text": loss_text,
+        "has_reasoning": "<think>" in loss_text or "We need to find the precise title" in loss_text,
+        "has_final_answer": "## Exact Answer" in loss_text,
+        "tool_call_count": loss_text.count("<tool_call>"),
+        "loss_token_count": int(item["loss_mask"].sum().item()),
+    }
 
 
 def check_tool_call_tags(rendered_text: str):
@@ -389,11 +423,28 @@ def run_tests(args):
         print(f"  [FAIL] No <tool_call> blocks found in rendered text")
         all_pass = False
 
+    print(f"\n  Real training path (MultiTurnSFTDataset):")
+    training_path = inspect_training_path(tokenizer, args.data_path)
+    print(f"    loss_token_count: {training_path['loss_token_count']}")
+    print(f"    tool_call_count: {training_path['tool_call_count']}")
+    print(f"    has_reasoning: {training_path['has_reasoning']}")
+    print(f"    has_final_answer: {training_path['has_final_answer']}")
+    if training_path["has_reasoning"]:
+        print("  [PASS] Training loss mask includes reasoning tokens")
+    else:
+        print("  [FAIL] Training loss mask is missing reasoning tokens")
+        all_pass = False
+    if training_path["has_final_answer"]:
+        print("  [PASS] Training loss mask includes final answer tokens")
+    else:
+        print("  [FAIL] Training loss mask is missing final answer tokens")
+        all_pass = False
+
     if all_pass:
         print(f"\n  RESULT: SFT tokenization correctly produces tool_call tags")
-        print(f"  The model should learn to generate <tool_call> tags for all 3 tools")
+        print("  The model should learn reasoning, tool calls, and final answers from the real training path")
     else:
-        print(f"\n  RESULT: SFT tokenization has issues - model may not learn tool_call format")
+        print("\n  RESULT: SFT tokenization has issues in the real training path")
 
     # Write rendered text to file for manual inspection
     if args.output:

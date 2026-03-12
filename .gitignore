@@ -1,3 +1,8 @@
+# Secrets
+**/.env
+**/api.md
+**/api.key
+
 **/*.pt
 **/checkpoints
 **/wget-log

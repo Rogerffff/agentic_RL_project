@@ -37,7 +37,6 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
@@ -542,23 +541,17 @@ class RayPPOTrainer:
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # pad to be divisible by dp_size
-            size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            test_output_gen_batch = self.async_rollout_manager.generate_sequences(test_gen_batch)
 
-            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+            if self.use_rm and "rm_scores" not in test_output_gen_batch.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
                 # to spare GPU memory for reward model
                 self.checkpoint_manager.sleep_replicas()
-                batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
-                test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
+                batch_reward = self._compute_reward_colocate(test_output_gen_batch)
+                test_output_gen_batch = test_output_gen_batch.union(batch_reward)
                 # wake up rollout model
                 # replace with wake_up method once supported
                 self.checkpoint_manager.update_weights()
-
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             print("validation generation end")
 

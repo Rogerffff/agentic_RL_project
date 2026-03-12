@@ -114,6 +114,7 @@ class CaRRToolAgentLoop(ToolAgentLoop):
         pending_tool_calls = []
         turn_idx = 0
         hit_limit = False  # True if terminated by response_length / max_turns limit
+        termination_reason = None
         total_tool_calls = 0
         search_count = 0
         open_count = 0
@@ -135,12 +136,15 @@ class CaRRToolAgentLoop(ToolAgentLoop):
 
                     # Detect if terminated by limit (before tool_calls extraction)
                     if state == AgentState.TERMINATED:
-                        if (
-                            len(agent_data.response_mask) >= self.response_length
-                            or (self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns)
-                            or (self.max_user_turns and agent_data.user_turns >= self.max_user_turns)
-                        ):
+                        if len(agent_data.response_mask) >= self.response_length:
                             hit_limit = True
+                            termination_reason = "response_limit"
+                        elif self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
+                            hit_limit = True
+                            termination_reason = "assistant_turn_limit"
+                        elif self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
+                            hit_limit = True
+                            termination_reason = "user_turn_limit"
 
                     # Build assistant entry for reward_history from this turn's generation
                     assistant_text = await self.loop.run_in_executor(
@@ -197,6 +201,7 @@ class CaRRToolAgentLoop(ToolAgentLoop):
                     # on response_length overflow
                     if state == AgentState.TERMINATED:
                         hit_limit = True
+                        termination_reason = "response_limit"
 
                 elif state == AgentState.INTERACTING:
                     state = await self._handle_interacting_state(agent_data)
@@ -251,6 +256,15 @@ class CaRRToolAgentLoop(ToolAgentLoop):
             "find_count": find_count,
             "hit_limit": hit_limit,
             "parse_error_count": parse_error_count,
+            "termination_reason": termination_reason,
+            "termination_response_limit": 1.0 if termination_reason == "response_limit" else 0.0,
+            "termination_assistant_turn_limit": 1.0 if termination_reason == "assistant_turn_limit" else 0.0,
+            "termination_user_turn_limit": 1.0 if termination_reason == "user_turn_limit" else 0.0,
+            "response_length": float(len(agent_data.response_mask)),
+            "response_length_max": float(self.response_length),
+            "response_length_ratio": float(len(agent_data.response_mask) / self.response_length)
+            if self.response_length
+            else 0.0,
         })
         return output
 

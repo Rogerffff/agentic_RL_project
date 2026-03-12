@@ -126,7 +126,7 @@ class MultiTurnSFTDataset(Dataset):
         self.seed = config.get("seed")
         self.max_samples = max_samples
         self.ignore_input_ids_mismatch = config.get("ignore_input_ids_mismatch", False)
-        assert self.truncation in ["error", "left", "right"]
+        assert self.truncation in ["error", "left", "right", "loss_window"]
 
         if not isinstance(parquet_files, list | ListConfig):
             parquet_files = [parquet_files]
@@ -200,6 +200,12 @@ class MultiTurnSFTDataset(Dataset):
     def __len__(self):
         return len(self.messages)
 
+    def _get_apply_chat_template_kwargs(self, enable_thinking: Optional[bool]) -> dict[str, Any]:
+        apply_chat_template_kwargs = {**self.apply_chat_template_kwargs}
+        if enable_thinking is not None:
+            apply_chat_template_kwargs["enable_thinking"] = enable_thinking
+        return apply_chat_template_kwargs
+
     def _process_single_message(
         self,
         index: int,
@@ -223,9 +229,7 @@ class MultiTurnSFTDataset(Dataset):
             Tuple of (input_ids, loss_mask, attention_mask, dict[str, torch.Tensor])
         """
         processor = self.processor if self.processor is not None else self.tokenizer
-        apply_chat_template_kwargs = {**self.apply_chat_template_kwargs}
-        if enable_thinking is not None:
-            apply_chat_template_kwargs["enable_thinking"] = enable_thinking
+        apply_chat_template_kwargs = self._get_apply_chat_template_kwargs(enable_thinking)
 
         inputs = processor.apply_chat_template(
             [message],
@@ -254,6 +258,95 @@ class MultiTurnSFTDataset(Dataset):
             loss_mask = torch.zeros_like(attention_mask)
 
         return input_ids, loss_mask, attention_mask, inputs
+
+    def _process_messages_with_context(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Optional[list[dict[str, Any]]] = None,
+        enable_thinking: Optional[bool] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Tokenize text-only multi-turn data using full-prefix rendering.
+
+        Qwen thinking templates may drop `reasoning_content` when an assistant message
+        is rendered in isolation. Rendering the conversation prefix up to each turn and
+        taking the newly appended span preserves the exact in-context serialization that
+        the model should learn from.
+        """
+        apply_chat_template_kwargs = self._get_apply_chat_template_kwargs(enable_thinking)
+
+        input_id_chunks = []
+        loss_mask_chunks = []
+        attention_mask_chunks = []
+        prefix_input_ids: Optional[torch.Tensor] = None
+
+        for end_idx, message in enumerate(messages, start=1):
+            current_input_ids = torch.tensor(
+                self.tokenizer.apply_chat_template(
+                    messages[:end_idx],
+                    tools=tools,
+                    add_generation_prompt=False,
+                    tokenize=True,
+                    **apply_chat_template_kwargs,
+                ),
+                dtype=torch.long,
+            )
+
+            if prefix_input_ids is None:
+                start_idx = 0
+            else:
+                prefix_len = prefix_input_ids.shape[0]
+                if current_input_ids.shape[0] < prefix_len or not torch.equal(
+                    current_input_ids[:prefix_len], prefix_input_ids
+                ):
+                    raise AssertionError(
+                        "Chat template prefix is not stable across turns. "
+                        "MultiTurnSFTDataset cannot derive per-message spans safely. "
+                        "If this is expected for your template, set ignore_input_ids_mismatch=true "
+                        "and the dataset will fall back to the per-message tokenization path."
+                    )
+                start_idx = prefix_len
+
+            delta_input_ids = current_input_ids[start_idx:]
+            delta_attention_mask = torch.ones_like(delta_input_ids, dtype=torch.long)
+            if message["role"] == "assistant":
+                delta_loss_mask = torch.ones_like(delta_attention_mask)
+                delta_loss_mask[: min(len(self.generation_prompt), delta_loss_mask.numel())] = 0
+            else:
+                delta_loss_mask = torch.zeros_like(delta_attention_mask)
+
+            input_id_chunks.append(delta_input_ids)
+            loss_mask_chunks.append(delta_loss_mask)
+            attention_mask_chunks.append(delta_attention_mask)
+            prefix_input_ids = current_input_ids
+
+        return (
+            torch.cat(input_id_chunks, dim=0),
+            torch.cat(loss_mask_chunks, dim=0),
+            torch.cat(attention_mask_chunks, dim=0),
+        )
+
+    def _get_truncation_slice(self, loss_mask: torch.Tensor, sequence_length: int) -> slice:
+        if sequence_length <= self.max_length:
+            return slice(0, sequence_length)
+        if self.truncation == "left":
+            return slice(sequence_length - self.max_length, sequence_length)
+        if self.truncation == "right":
+            return slice(0, self.max_length)
+        if self.truncation == "loss_window":
+            if loss_mask.sum().item() == 0:
+                return slice(0, self.max_length)
+
+            loss_mask_int = loss_mask.to(torch.int64)
+            prefix = torch.zeros(sequence_length + 1, dtype=torch.int64)
+            prefix[1:] = torch.cumsum(loss_mask_int, dim=0)
+            window_scores = prefix[self.max_length :] - prefix[: sequence_length - self.max_length + 1]
+            best_score = torch.max(window_scores)
+            best_starts = torch.nonzero(window_scores == best_score, as_tuple=False).flatten()
+            best_start = int(best_starts[-1].item())
+            return slice(best_start, best_start + self.max_length)
+        if self.truncation == "error":
+            raise ValueError(f"{sequence_length=} is larger than {self.max_length=}")
+        raise ValueError(f"Unknown truncation method {self.truncation}")
 
     def _build_messages(self, example: dict):
         """Replace <image> and <video> placeholder in messages with corresponding image and video
@@ -309,25 +402,39 @@ class MultiTurnSFTDataset(Dataset):
             self.enable_thinking[item] if self.enable_thinking is not None else self.enable_thinking_default
         )
 
-        # 1. tokenize each message
-        input_ids, loss_mask, attention_mask, multi_modal_inputs = [], [], [], {}
-        for i, message in enumerate(messages):
-            _input_ids, _loss_mask, _attention_mask, _inputs = self._process_single_message(
-                index=i,
-                message=message,
-                full_message=messages,
-                tools=tools if i == 0 else None,
-                enable_thinking=enable_thinking,
+        multi_modal_inputs = {}
+        if self.processor is None:
+            # Text-only path: use prefix-based rendering to preserve full conversation
+            # context.  This is required because some templates (e.g. Qwen3 Thinking)
+            # silently drop `reasoning_content` when a single assistant message is
+            # rendered in isolation via apply_chat_template([message]).
+            # The multimodal path below still uses per-message rendering because the
+            # processor returns extra tensors (pixel_values, image_grid_thw, etc.)
+            # that are per-message and cannot be derived from prefix subtraction.
+            input_ids, loss_mask, attention_mask = self._process_messages_with_context(
+                messages=messages, tools=tools, enable_thinking=enable_thinking
             )
-            input_ids.append(_input_ids)
-            loss_mask.append(_loss_mask)
-            attention_mask.append(_attention_mask)
-            for k, v in _inputs.items():
-                multi_modal_inputs.setdefault(k, []).append(v)
+        else:
+            # 1. tokenize each message
+            input_ids, loss_mask, attention_mask = [], [], []
+            for i, message in enumerate(messages):
+                _input_ids, _loss_mask, _attention_mask, _inputs = self._process_single_message(
+                    index=i,
+                    message=message,
+                    full_message=messages,
+                    tools=tools if i == 0 else None,
+                    enable_thinking=enable_thinking,
+                )
+                input_ids.append(_input_ids)
+                loss_mask.append(_loss_mask)
+                attention_mask.append(_attention_mask)
+                for k, v in _inputs.items():
+                    multi_modal_inputs.setdefault(k, []).append(v)
 
-        input_ids = torch.cat(input_ids, dim=0)
-        loss_mask = torch.cat(loss_mask, dim=0)
-        attention_mask = torch.cat(attention_mask, dim=0)
+            input_ids = torch.cat(input_ids, dim=0)
+            loss_mask = torch.cat(loss_mask, dim=0)
+            attention_mask = torch.cat(attention_mask, dim=0)
+
         assert input_ids.shape == loss_mask.shape == attention_mask.shape, (
             f"Shape mismatch: {input_ids.shape}, {loss_mask.shape}, {attention_mask.shape}"
         )
@@ -385,20 +492,11 @@ class MultiTurnSFTDataset(Dataset):
                 loss_mask = torch.cat((loss_mask, padded_loss_mask))
                 position_ids = F.pad(position_ids, (0, self.max_length - sequence_length), value=0)
             elif sequence_length > self.max_length:
-                if self.truncation == "left":
-                    input_ids = input_ids[-self.max_length :]
-                    attention_mask = attention_mask[-self.max_length :]
-                    loss_mask = loss_mask[-self.max_length :]
-                    position_ids = position_ids[..., -self.max_length :]
-                elif self.truncation == "right":
-                    input_ids = input_ids[: self.max_length]
-                    attention_mask = attention_mask[: self.max_length]
-                    loss_mask = loss_mask[: self.max_length]
-                    position_ids = position_ids[..., : self.max_length]
-                elif self.truncation == "error":
-                    raise ValueError(f"{sequence_length=} is larger than {self.max_length=}")
-                else:
-                    raise ValueError(f"Unknown truncation method {self.truncation}")
+                truncation_slice = self._get_truncation_slice(loss_mask=loss_mask, sequence_length=sequence_length)
+                input_ids = input_ids[truncation_slice]
+                attention_mask = attention_mask[truncation_slice]
+                loss_mask = loss_mask[truncation_slice]
+                position_ids = position_ids[..., truncation_slice]
 
             res = {
                 "input_ids": input_ids,
@@ -412,9 +510,10 @@ class MultiTurnSFTDataset(Dataset):
         elif self.pad_mode == DatasetPadMode.NO_PADDING:
             # truncate input_ids if it is longer than max_length
             if len(input_ids) > self.max_length:
-                input_ids = input_ids[: self.max_length]
-                loss_mask = loss_mask[: self.max_length]
-                position_ids = position_ids[..., : self.max_length]
+                truncation_slice = self._get_truncation_slice(loss_mask=loss_mask, sequence_length=len(input_ids))
+                input_ids = input_ids[truncation_slice]
+                loss_mask = loss_mask[truncation_slice]
+                position_ids = position_ids[..., truncation_slice]
 
             # return nested tensor with out padding
             res = {
@@ -433,9 +532,7 @@ class MultiTurnSFTDataset(Dataset):
         apply_chat_template to whole messages.
         """
         processor = self.processor if self.processor is not None else self.tokenizer
-        apply_chat_template_kwargs = {**self.apply_chat_template_kwargs}
-        if enable_thinking is not None:
-            apply_chat_template_kwargs["enable_thinking"] = enable_thinking
+        apply_chat_template_kwargs = self._get_apply_chat_template_kwargs(enable_thinking)
         inputs = processor.apply_chat_template(
             messages,
             tools=tools,

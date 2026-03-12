@@ -27,6 +27,18 @@ from verl import DataProto
 from verl.utils.import_utils import deprecated
 
 
+def _is_numeric_metric_value(value: Any) -> bool:
+    """Return True when a validation metric value can be aggregated numerically.
+
+    Validation dumps may contain auxiliary categorical fields such as
+    ``termination_reason``. Those fields can be strings or ``None`` and should not
+    be routed through numeric reducers like ``np.mean``.
+    """
+    if value is None or isinstance(value, (str, bytes)):
+        return False
+    return isinstance(value, (bool, int, float, np.number, np.bool_))
+
+
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     """
@@ -617,8 +629,11 @@ def process_validation_metrics(
             var_dict = uid_dict.setdefault(uid, {})
 
             for var_name, var_vals in var2vals.items():
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+                # Skip empty, categorical, or partially missing values.
+                # Validation outputs may include string/None fields such as
+                # termination_reason that should be dumped to JSONL but not
+                # aggregated as numeric metrics.
+                if not var_vals or not all(_is_numeric_metric_value(val) for val in var_vals):
                     continue
 
                 # compute mean and std

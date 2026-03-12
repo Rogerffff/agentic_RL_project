@@ -88,6 +88,13 @@ async def compute_score(data_source, solution_str, ground_truth, extra_info=None
         "find_count": float(extra_info.get("find_count", 0)),
         "hit_limit": float(extra_info.get("hit_limit", False)),
         "parse_error_count": float(extra_info.get("parse_error_count", 0)),
+        "termination_reason": extra_info.get("termination_reason"),
+        "termination_response_limit": float(extra_info.get("termination_response_limit", 0)),
+        "termination_assistant_turn_limit": float(extra_info.get("termination_assistant_turn_limit", 0)),
+        "termination_user_turn_limit": float(extra_info.get("termination_user_turn_limit", 0)),
+        "response_length": float(extra_info.get("response_length", 0)),
+        "response_length_max": float(extra_info.get("response_length_max", 0)),
+        "response_length_ratio": float(extra_info.get("response_length_ratio", 0)),
     }
 
     payload = {

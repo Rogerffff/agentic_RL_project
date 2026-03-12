@@ -27,10 +27,25 @@ Output: browsecomp_eval.parquet
 """
 
 import argparse
+import base64
+import hashlib
 import os
 
 import datasets
 import pandas as pd
+
+
+def _derive_key(password: str, length: int) -> bytes:
+    """Derive a repeating key from password using SHA-256 (BrowseComp official method)."""
+    digest = hashlib.sha256(password.encode()).digest()  # 32 bytes
+    return digest * (length // len(digest)) + digest[: length % len(digest)]
+
+
+def _decrypt(ciphertext_b64: str, password: str) -> str:
+    """Decrypt base64-encoded XOR ciphertext using the canary field as password."""
+    encrypted = base64.b64decode(ciphertext_b64)
+    key = _derive_key(password, len(encrypted))
+    return bytes(a ^ b for a, b in zip(encrypted, key)).decode()
 
 FORMAT_SUFFIX = """
 
@@ -69,10 +84,26 @@ def main():
 
     print(f"Loaded {len(dataset)} records")
 
+    # Detect whether fields are encrypted (base64-encoded ciphertext)
+    # by checking if the first problem decodes to valid UTF-8 with the canary key
+    sample = dataset[0]
+    try:
+        _decrypt(sample["problem"], sample["canary"])
+        needs_decrypt = True
+        print("Detected encrypted fields — decrypting with canary key")
+    except Exception:
+        needs_decrypt = False
+        print("Fields appear to be plaintext — no decryption needed")
+
     records = []
     for idx, example in enumerate(dataset):
-        problem = example["problem"]
-        answer = example["answer"]
+        canary = example["canary"]
+        if needs_decrypt:
+            problem = _decrypt(example["problem"], canary)
+            answer = _decrypt(example["answer"], canary)
+        else:
+            problem = example["problem"]
+            answer = example["answer"]
 
         # Build tools_kwargs (same structure as RL data)
         tools_kwargs = {

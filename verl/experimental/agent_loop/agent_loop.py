@@ -950,12 +950,16 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
+        num_workers = len(self.agent_loop_workers)
+        active_workers = min(num_workers, len(prompts))
+        while active_workers > 1 and len(prompts) % active_workers != 0:
+            active_workers -= 1
 
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
+        chunkes = prompts.chunk(active_workers)
         outputs = ray.get(
             [
                 worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+                for worker, chunk in zip(self.agent_loop_workers[:active_workers], chunkes, strict=True)
             ]
         )
         output = DataProto.concat(outputs)
