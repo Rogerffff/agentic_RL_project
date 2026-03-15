@@ -756,3 +756,49 @@ Changed `truncation: right` → `truncation: loss_window`.
 2. **Re-run DeepDive eval** with the new checkpoint + `enable_thinking` RL config
 3. Verify that the model now produces `<think>` reasoning blocks and final answers
 4. If eval shows improved completion rate, proceed to formal RL training
+
+## 8x H200 Clean RL Probe (No Val / No Save / TP1)
+
+On the 8x H200 instance, we ran a clean 1-step RL probe to remove the previous
+"last-step validation/save" confound:
+
+- `trainer.val_before_train=false`
+- `trainer.test_freq=0`
+- `trainer.save_freq=0`
+- `data.train_batch_size=8`
+- `actor_rollout_ref.rollout.n=4`
+- `actor_rollout_ref.rollout.tensor_model_parallel_size=1`
+- `data.max_response_length=61400`
+- `max_assistant_turns=80`
+- `max_tool_response_length=6000`
+
+Remote artifacts:
+
+- log: `/workspace/logs/carr_cgrpo_h200_probe_clean_tp1.log`
+- reward trace: `/workspace/logs/carr_reward_trace_h200_probe_clean_tp1.jsonl`
+
+Observed result:
+
+- all `32` real trajectories reached reward evaluation
+- `15` were `evaluate_result`
+- `17` were `evaluate_short_circuit`
+- mean reward over `evaluate_result` was about `0.516`
+- after all `32` real reward events completed, the run still did not log
+  `step:1`
+- GPUs remained near full utilization with about `132 GB` allocated per card
+
+Interpretation:
+
+- This is stronger evidence than the earlier probes because validation and
+  checkpoint saving were explicitly disabled.
+- `rollout + tool + reward` are no longer the only explanation for the delay;
+  after rollout completion, the remaining bottleneck is downstream, most likely
+  `old_log_prob` / PPO update.
+- Adding more reward servers may help earlier-stage latency, but it will not
+  fix this specific post-rollout stall by itself.
+
+Practical implication:
+
+- Do not launch formal RL yet on this recipe.
+- The next useful probes should reduce training-side work further (for example
+  `b4/n4`) or profile the post-rollout path directly.

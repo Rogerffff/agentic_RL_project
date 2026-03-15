@@ -103,6 +103,7 @@ bash examples/carr_deepsearch/scripts/run_rl.sh \
 | 文件 | 说明 |
 |------|------|
 | `progress_2x5090.md` | 2x RTX 5090 环境验证进度报告。含所有 Gate 验证记录、调试问题汇总、正式训练规划（GPU 选择、训练时长、API 用量估算、完整训练命令） |
+| `project_retrospective_20260312.md` | 本轮 RL 训练前复盘长文。系统解释为什么大多数配置失败、为什么成本失控、为什么 `b4/n4, TP1` 是当前唯一稳定口径，以及下一轮最该先修什么 |
 
 ### 根目录项目文档
 
@@ -203,6 +204,124 @@ bash examples/carr_deepsearch/scripts/run_rl.sh \
 ---
 
 ## 关键设计决策与注意事项
+
+### RL 正式训练前问题索引
+
+下面这份列表只做**简要索引**，帮助后续 agent 快速知道在正式 RL 训练前已经踩过哪些坑。  
+如果需要完整背景、证据和根因分析，请优先阅读 [docs/project_retrospective_20260312.md](./docs/project_retrospective_20260312.md)。
+
+#### 1. 错误的 SFT 起点会直接污染 RL 判断
+
+- 早期曾经使用过有问题的 SFT 起点，导致模型容易：
+  - 疯狂调用工具
+  - 不会稳定收束到最终答案
+  - 让人误以为是 RL 链路坏了
+- 当前应以**修正后的 SFT 主链路 checkpoint**作为唯一 RL 起点。
+- 详见复盘中的“监督微调起点错误”。
+
+#### 2. `task_unfinished=True` 会让 reward server 直接返回 0
+
+- 这会造成一种错觉：看起来像是 DeepSeek judge 没工作。
+- 真实情况通常是：
+  - rollout 没在限制条件内完成
+  - reward server 直接 short-circuit 为零分
+- 早期多轮 probe 中，大量零分其实是 unfinished，不是 reward server 宕掉。
+- 详见复盘中的“`task_unfinished` 与 reward short-circuit”。
+
+#### 3. assistant turn limit 和 response limit 都曾是主要失败模式
+
+- 早期 probe 中，`max_assistant_turns` 偏小会让样本在还没接近 64k 时就先被截断。
+- 后续提高 turn limit 后，又确认一部分样本会转而撞上 `max_response_length`。
+- 说明问题不是单一阈值，而是：
+  - turn limit
+  - response limit
+  - 无效工具循环
+  三者共同作用。
+- 详见复盘中关于 termination reason 与 unfinished 的部分。
+
+#### 4. “没看到 `step:1`”不能直接判定 PPO 卡死
+
+- 多轮排查后确认，以下因素都曾误导 probe 结论：
+  - `trainer.val_before_train`
+  - 最后一步 validation
+  - 最后一步 save
+  - reward trace 里混入 health check
+- 因此后续所有 `1-step probe` 必须显式设为 clean probe：
+  - `trainer.val_before_train=false`
+  - `trainer.test_freq=0`
+  - `trainer.save_freq=0`
+- 详见复盘中的“validation/save/Ray 对 probe 的误导”。
+
+#### 5. RL 早期有过配置级硬错误，不是策略问题
+
+- 典型问题包括：
+  - `train_batch_size * rollout.n` 与 agent loop worker 数不整除
+  - `ppo_max_token_len_per_gpu` 太小，导致 `max_token_len must be greater than the sequence length`
+  - `actor_rollout_ref.model.path` 需要显式 CLI override，不能只赌环境变量
+- 这些问题会让 run 在 rollout 之后或更早阶段直接失败，不能拿来判断 reward signal。
+- 详见复盘与 `docs/rl_debug_findings_20260312.md`。
+
+#### 6. 4xA100 上不是“完全跑不动”，而是吞吐不经济
+
+- 4xA100 已证明：
+  - RL 主链路能走通
+  - 可以产生真实 reward
+- 但正式并发口径 wall time 过长，不适合作为正式 RL 主训练机型。
+- 这不是“显存不够”，而是系统吞吐结构不经济。
+- 详见复盘中的成本章节。
+
+#### 7. 8x RTX PRO 6000 Blackwell 主要卡在 SGLang `TP=2` generate 路径
+
+- 该机器不是单纯“训练慢”，而是 standalone SGLang 就能复现：
+  - `TP=1` 正常
+  - `TP=2` server 可启动，但真实 `/generate` 会卡住
+- 因此它不适合作为当前正式 RL 机器。
+- 详见复盘和 `docs/blackwell_sglang_debug_20260312.md`。
+
+#### 8. 8xH200 上真正稳定打出 `step:1` 的是 `b4/n4, TP1`
+
+- 这套 clean probe 是第一套已确认：
+  - rollout 完成
+  - reward 完成
+  - old_log_prob / update_actor / update_weights 全部完成
+  - 明确打出 `step:1`
+- 但它仍然太贵，不能直接当正式经济配方。
+- 详见复盘中的 `b4/n4, TP1` 成本分析。
+
+#### 9. `b16/n8` 不是“显存够了就该更快”
+
+- 当前实现里，放大 `train_batch_size` 和 `rollout.n` 主要是在放大：
+  - rollout 队列深度
+  - 外部工具长尾
+  - reward judge 长尾
+  - 同步栅栏等待
+- 因此 `b16/n8` 在当前 infra 下不经济，不应直接作为正式训练默认值。
+- 详见复盘中的“为什么 `b16/n8` 不是显存够了就该更快”。
+
+#### 10. H200 上还踩过系统层问题：`Too many open files`
+
+- 远端 H200 机器曾出现：
+  - `ulimit -n = 1024`
+  - `ray_init.num_cpus = null` / Ray 默认吃满整机 CPU
+  联合作用导致 Ray 启动期 `Too many open files`
+- 这类问题和模型策略无关，但会直接破坏 probe 解释。
+- 后续租机时应优先固定：
+  - `ulimit -n 65535`
+  - `ray start --num-cpus=32`
+  - `+ray_kwargs.ray_init.address=auto`
+- 详见复盘中的“Ray 启动期问题”。
+
+#### 11. 当前最大问题是系统吞吐结构，不是单个组件“坏掉”
+
+- 不能简单说：
+  - “GPU 不是瓶颈”
+  - “reward server 就是唯一瓶颈”
+  - “PPO 后半段一定卡死”
+- 更准确的说法是：
+  - 瓶颈会随配置迁移
+  - 低并发稳定口径里主瓶颈更像 rollout/generation
+  - 更高并发下 post-rollout 也会被放大成新瓶颈
+- 详见复盘的“为什么成本失控”与“为什么 `b16/n8` 不经济”。
 
 ### SFT-RL Tool Schema 一致性
 
