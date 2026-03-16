@@ -70,6 +70,89 @@ class CaRRToolAgentLoop(ToolAgentLoop):
                 self.tool_server_url = tool.tool_server_url
                 break
 
+    def _extract_completed_answer_text(self, assistant_text: str) -> str | None:
+        """Return a safely trimmable final answer prefix, or ``None``.
+
+        This is intentionally conservative: it only fires when the assistant has
+        already emitted the expected final-answer sections and there are no
+        tool-call markers in the text.
+        """
+        if "<tool_call>" in assistant_text or "</tool_call>" in assistant_text:
+            return None
+
+        exact_pos = assistant_text.find("## Exact Answer")
+        refs_pos = assistant_text.find("## References")
+        if exact_pos == -1 or refs_pos == -1 or refs_pos <= exact_pos:
+            return None
+
+        ref_line_pattern = re.compile(r"^\s*(\[\d+\]|\d+\.\s+|[-*]\s+|https?://)")
+        ref_section = assistant_text[refs_pos:]
+        lines = ref_section.splitlines(keepends=True)
+        if not lines:
+            return None
+
+        kept_chars = len(lines[0])  # Keep the "## References" heading.
+        saw_reference_entry = False
+
+        for line in lines[1:]:
+            stripped = line.strip()
+            if not saw_reference_entry:
+                if not stripped:
+                    kept_chars += len(line)
+                    continue
+                if ref_line_pattern.match(stripped):
+                    saw_reference_entry = True
+                    kept_chars += len(line)
+                    continue
+                return None
+
+            if not stripped:
+                kept_chars += len(line)
+                continue
+            if ref_line_pattern.match(stripped):
+                kept_chars += len(line)
+                continue
+            break
+
+        if not saw_reference_entry:
+            return None
+
+        return assistant_text[: refs_pos + kept_chars].rstrip()
+
+    def _try_trim_completed_answer(self, agent_data: AgentData, assistant_text: str) -> str | None:
+        """Trim the current assistant turn if a complete final answer is present.
+
+        The trim is applied only when the decoded prefix can be mapped back to a
+        prefix of the current token ids with a stable decode/encode round trip.
+        """
+        trimmed_text = self._extract_completed_answer_text(assistant_text)
+        if trimmed_text is None:
+            return None
+
+        trimmed_ids = self.tokenizer.encode(trimmed_text, add_special_tokens=False)
+        trimmed_len = len(trimmed_ids)
+        current_len = len(agent_data.response_ids)
+        if trimmed_len <= 0 or trimmed_len > current_len:
+            return None
+
+        current_prefix_text = self.tokenizer.decode(agent_data.response_ids[:trimmed_len], skip_special_tokens=True)
+        normalize = lambda s: re.sub(r"\s+", " ", s).strip()
+        if normalize(current_prefix_text) != normalize(trimmed_text):
+            return None
+
+        current_turn_logprobs = None
+        if agent_data.response_logprobs:
+            current_turn_logprobs = agent_data.response_logprobs[-current_len:]
+
+        prefix_prompt_len = len(agent_data.prompt_ids) - current_len
+        agent_data.response_ids = agent_data.response_ids[:trimmed_len]
+        agent_data.prompt_ids = agent_data.prompt_ids[:prefix_prompt_len] + agent_data.response_ids
+        agent_data.response_mask = agent_data.response_mask[:-current_len] + [1] * trimmed_len
+        if current_turn_logprobs is not None:
+            agent_data.response_logprobs = agent_data.response_logprobs[:-current_len] + current_turn_logprobs[:trimmed_len]
+
+        return trimmed_text
+
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
@@ -120,6 +203,7 @@ class CaRRToolAgentLoop(ToolAgentLoop):
         open_count = 0
         find_count = 0
         parse_error_count = 0
+        content_early_stopped = False
 
         try:
             state = AgentState.PENDING
@@ -150,6 +234,16 @@ class CaRRToolAgentLoop(ToolAgentLoop):
                     assistant_text = await self.loop.run_in_executor(
                         None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
                     )
+
+                    if not agent_data.tool_calls:
+                        trimmed_text = self._try_trim_completed_answer(agent_data, assistant_text)
+                        if trimmed_text is not None:
+                            assistant_text = trimmed_text
+                            content_early_stopped = True
+                            # If we already have a complete final answer, do not
+                            # treat this turn as an unfinished hard-limit failure.
+                            hit_limit = False
+                            termination_reason = None
 
                     if agent_data.tool_calls:
                         # Assistant message with tool calls (only if base actually parsed them)
@@ -260,6 +354,7 @@ class CaRRToolAgentLoop(ToolAgentLoop):
             "termination_response_limit": 1.0 if termination_reason == "response_limit" else 0.0,
             "termination_assistant_turn_limit": 1.0 if termination_reason == "assistant_turn_limit" else 0.0,
             "termination_user_turn_limit": 1.0 if termination_reason == "user_turn_limit" else 0.0,
+            "content_early_stopped": content_early_stopped,
             "response_length": float(len(agent_data.response_mask)),
             "response_length_max": float(self.response_length),
             "response_length_ratio": float(len(agent_data.response_mask) / self.response_length)

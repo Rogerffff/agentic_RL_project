@@ -25,11 +25,16 @@ at the request level and closed in the agent loop's finally block.
 
 import asyncio
 import logging
+import os
 from typing import Any, Dict, Set, Tuple
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+# Tool server search/open can spend up to roughly 3 * 30s on upstream retries.
+TOOL_SERVER_CLIENT_TIMEOUT_S = float(os.environ.get("CARR_TOOL_CLIENT_TIMEOUT_S", "120"))
+_ARG_PREVIEW_MAX_CHARS = 160
 
 
 class CaRRSessionManager:
@@ -74,6 +79,25 @@ class CaRRSessionManager:
     def get_session_data(self, session_id: str) -> Dict[str, Any]:
         return self._session_data.get(session_id, {})
 
+    def _summarize_arguments(self, name: str, arguments: dict) -> str:
+        if name == "browser.search":
+            value = arguments.get("query", "")
+            key = "query"
+        elif name == "browser.open":
+            value = arguments.get("id", "")
+            key = "id"
+        elif name == "browser.find":
+            value = arguments.get("pattern", "")
+            key = "pattern"
+        else:
+            value = arguments
+            key = "arguments"
+
+        text = repr(value)
+        if len(text) > _ARG_PREVIEW_MAX_CHARS:
+            text = text[: _ARG_PREVIEW_MAX_CHARS - 3] + "..."
+        return f"{key}={text}"
+
     async def call_server(
         self,
         url: str,
@@ -87,6 +111,7 @@ class CaRRSessionManager:
         Returns:
             (ok, output): ok is True if HTTP 200, output is the response text.
         """
+        arg_summary = self._summarize_arguments(name, arguments)
         payload = {
             "session_id": session_id,
             "name": name,
@@ -98,17 +123,36 @@ class CaRRSessionManager:
             async with session.post(
                 url,
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=aiohttp.ClientTimeout(total=TOOL_SERVER_CLIENT_TIMEOUT_S),
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
-                    logger.error("Tool server HTTP %s: %s", resp.status, error_text[:200])
-                    return False, "Tool server HTTP %d" % resp.status
+                    logger.error(
+                        "Tool server HTTP %s for %s (%s, session=%s, timeout=%.1fs): %s",
+                        resp.status,
+                        name,
+                        arg_summary,
+                        session_id,
+                        TOOL_SERVER_CLIENT_TIMEOUT_S,
+                        error_text[:200],
+                    )
+                    return False, f"Tool server HTTP {resp.status} for {name} ({arg_summary})"
                 result = await resp.json()
                 return True, result.get("output", "")
         except Exception as e:
-            logger.error("Error calling tool server: %s", e)
-            return False, "Error calling tool server: %s" % e
+            logger.error(
+                "Error calling tool server for %s (%s, session=%s, timeout=%.1fs): %s: %s",
+                name,
+                arg_summary,
+                session_id,
+                TOOL_SERVER_CLIENT_TIMEOUT_S,
+                type(e).__name__,
+                e,
+            )
+            return (
+                False,
+                f"Error calling tool server for {name} ({arg_summary}): {type(e).__name__}: {e}",
+            )
 
     def _get_http_session(self) -> aiohttp.ClientSession:
         loop = asyncio.get_running_loop()

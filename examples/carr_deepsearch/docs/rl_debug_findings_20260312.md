@@ -757,6 +757,225 @@ Changed `truncation: right` → `truncation: loss_window`.
 3. Verify that the model now produces `<think>` reasoning blocks and final answers
 4. If eval shows improved completion rate, proceed to formal RL training
 
+## Sampling Parameter Fix for Thinking Models (2026-03-16)
+
+After switching to `Qwen/Qwen3-4B-Thinking-2507`, a new failure mode became
+clear during `subset8` evaluation:
+
+- under greedy validation
+  - `temperature=0`
+  - `do_sample=false`
+- the model could fall into deterministic loops
+  - some samples made `0` tool calls and repeated pure text
+  - some samples wrote most of the answer but never stopped
+  - wall time increased even when the trajectories were not productive
+
+This was initially misleading because it looked like a generic "the checkpoint
+is worse than the base model" problem. The later sampled eval showed that a
+large part of the regression was actually caused by the inference recipe, not
+just by the checkpoint itself.
+
+### What Was Wrong in verl
+
+In the multi-turn agent rollout path, `repetition_penalty` already existed in
+`RolloutConfig`, but the actual sampling params built inside the agent loop were
+hard-coded:
+
+- `verl/workers/config/rollout.py`
+  - `RolloutConfig.repetition_penalty` existed
+- `verl/experimental/agent_loop/agent_loop.py`
+  - `sampling_params["repetition_penalty"]` was always set to `1.0`
+- `SamplingConfig` did not expose:
+  - `repetition_penalty`
+  - `presence_penalty`
+  - `frequency_penalty`
+
+As a result:
+
+- changing `actor_rollout_ref.rollout.repetition_penalty=...` did **not**
+  affect multi-turn agentic rollout
+- there was no config-level way to test `presence_penalty` or
+  `frequency_penalty` in validation
+
+### Code Changes Applied
+
+Files:
+
+- `verl/workers/config/rollout.py`
+- `verl/trainer/config/rollout/rollout.yaml`
+- `verl/experimental/agent_loop/agent_loop.py`
+- `verl/experimental/fully_async_policy/agent_loop/agent_loop.py`
+
+Changes:
+
+1. Added these fields to both `SamplingConfig` and `RolloutConfig`:
+   - `repetition_penalty`
+   - `presence_penalty`
+   - `frequency_penalty`
+2. Added YAML defaults for both train rollout and `val_kwargs`
+3. Changed multi-turn agent loop sampling param construction to read:
+   - top-level rollout config for train rollout
+   - `val_kwargs` for validation / eval rollout
+4. Kept the change narrow:
+   - only sampling-param wiring was changed
+   - history handling was **not** changed
+
+Practical implication:
+
+- multi-turn eval and RL rollout can now be controlled by Hydra overrides
+- no code edit is needed for future sampling-parameter probes
+
+### Important Non-Fix: `<think>` History Replay Is Still Present
+
+This patch does **not** change how multi-turn prompts are accumulated.
+
+Current behavior in the agent loop is still:
+
+- generate assistant tokens
+- append raw generated token ids into `prompt_ids`
+- then parse tool calls
+- then continue the next turn
+
+So the previous turn's `<think>` content still remains in the next-turn model
+context. This is a separate issue and should not be considered fixed by the
+sampling patch.
+
+### Evidence: Why Greedy Validation Was Misleading
+
+Two `step591` `subset8` eval runs on the same checkpoint were compared.
+
+#### Greedy eval
+
+Recipe:
+
+- `temperature=0`
+- `do_sample=false`
+- `64k`, `tp=1`, `max_assistant_turns=120`, `max_tool_response_length=6000`
+
+Observed:
+
+- wall time: `852s`
+- `score mean@1 = 0.125`
+- `outcome_reward mean@1 = 0.125`
+- `task_unfinished mean@1 = 0.875`
+- `hit_limit mean@1 = 0.875`
+- two samples made `0` tool calls and collapsed into pure-text repetition
+
+#### Sampled eval
+
+Recipe:
+
+- `temperature=0.6`
+- `top_p=0.95`
+- `top_k=20`
+- `do_sample=true`
+- same `64k`, `tp=1`, `max_assistant_turns=120`, `max_tool_response_length=6000`
+
+Observed:
+
+- wall time: `492s`
+- `score mean@1 = 0.375`
+- `outcome_reward mean@1 = 0.375`
+- `rubric_reward mean@1 = 0.0871`
+- `task_unfinished mean@1 = 0.375`
+- `hit_limit mean@1 = 0.375`
+
+Interpretation:
+
+- for this Thinking checkpoint, greedy validation was not a neutral baseline
+- it amplified repetitive failure modes and made the model look worse than it
+  actually was
+- sampled validation was both:
+  - more faithful to the backbone's intended behavior
+  - materially cheaper in wall-clock time on the same 8-sample gate
+
+### How To Set Parameters Now
+
+There are now two separate layers to remember:
+
+1. **Training rollout**
+   - controlled by top-level `actor_rollout_ref.rollout.*`
+2. **Validation / eval rollout**
+   - controlled by `actor_rollout_ref.rollout.val_kwargs.*`
+
+#### Recommended eval recipe for Thinking checkpoints
+
+For `Qwen/Qwen3-4B-Thinking-2507`, do **not** use greedy eval as the main gate.
+
+Recommended first-pass validation recipe:
+
+```bash
+actor_rollout_ref.rollout.val_kwargs.temperature=0.6
+actor_rollout_ref.rollout.val_kwargs.top_p=0.95
+actor_rollout_ref.rollout.val_kwargs.top_k=20
+actor_rollout_ref.rollout.val_kwargs.do_sample=true
+```
+
+Optional anti-repetition ablations can now be run without code edits:
+
+```bash
+actor_rollout_ref.rollout.val_kwargs.repetition_penalty=1.05
+actor_rollout_ref.rollout.val_kwargs.presence_penalty=0.2
+actor_rollout_ref.rollout.val_kwargs.frequency_penalty=0.0
+```
+
+Important caution:
+
+- `presence_penalty=0.8` is supported after the patch, but it should be treated
+  as an explicit probe, not as a default recommendation
+- deep-search tasks naturally repeat:
+  - entity names
+  - search queries
+  - paper titles
+  - citation strings
+- so overly aggressive penalties can also suppress useful behavior
+
+#### Recommended RL rollout rule
+
+For RL training rollout, use the top-level rollout keys, for example:
+
+```bash
+actor_rollout_ref.rollout.temperature=1.0
+actor_rollout_ref.rollout.top_p=1.0
+actor_rollout_ref.rollout.top_k=-1
+actor_rollout_ref.rollout.do_sample=true
+```
+
+If repetition suppression is being tested during RL rollout, set it explicitly
+at the same top level:
+
+```bash
+actor_rollout_ref.rollout.repetition_penalty=1.05
+actor_rollout_ref.rollout.presence_penalty=0.2
+actor_rollout_ref.rollout.frequency_penalty=0.0
+```
+
+Do **not** assume that validation overrides affect training rollout. They do not.
+
+### Operator Guidance
+
+When debugging Thinking-model behavior in verl agent loop:
+
+- first separate **sampling-recipe problems** from **checkpoint-quality problems**
+- if a Thinking checkpoint only looks bad under greedy eval, do not immediately
+  conclude that SFT or RL is broken
+- always record:
+  - `temperature`
+  - `top_p`
+  - `top_k`
+  - `do_sample`
+  - any penalty terms
+- for multi-turn agentic tasks, compare both:
+  - score / unfinished rate
+  - wall-clock time
+
+This matters because a recipe can be both:
+
+- lower quality
+- and more expensive
+
+which is exactly what happened with greedy `step591 subset8`.
+
 ## 8x H200 Clean RL Probe (No Val / No Save / TP1)
 
 On the 8x H200 instance, we ran a clean 1-step RL probe to remove the previous
