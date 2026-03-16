@@ -25,6 +25,10 @@ fi
 export VERL_USE_EXTERNAL_MODULES=examples.carr_deepsearch.tools.carr_agent_loop,examples.carr_deepsearch.reward.cgrpo_advantage
 export CARR_REWARD_SERVER_URL="http://localhost:8888"
 export CARR_REWARD_TIMEOUT="650"
+# Ray 2.53 can crash natively in OpenTelemetry metrics init on some remote setups.
+# Disable it explicitly so eval startup does not depend on that fragile path.
+export RAY_enable_open_telemetry=0
+export RAY_ENABLE_OPEN_TELEMETRY=0
 
 # Route eval_set to val_files + extra args
 DATA_DIR="$PROJECT_DIR/examples/carr_deepsearch/data"
