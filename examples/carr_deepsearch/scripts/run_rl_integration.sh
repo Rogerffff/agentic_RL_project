@@ -28,6 +28,10 @@ log_step() {
   printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$LAUNCHER_LOG"
 }
 
+detect_gpu_names() {
+  nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd ';' - || true
+}
+
 if [ -f "$HOME/.env" ]; then
   set -a
   . "$HOME/.env"
@@ -47,12 +51,28 @@ export CARR_REWARD_TIMEOUT="${CARR_REWARD_TIMEOUT:-650}"
 export CARR_REWARD_TRACE_LOG=1
 export CARR_REWARD_TRACE_LOG_PATH="$TRACE_LOG"
 export CARR_TOOL_CLIENT_TIMEOUT_S="${CARR_TOOL_CLIENT_TIMEOUT_S:-120}"
-export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+
+GPU_NAMES="$(detect_gpu_names)"
+# Some Blackwell setups require explicitly disabling NCCL P2P, but the NVLink hosts
+# used for H100/H200/A100 probes in this project should keep the default NCCL path.
+if [ -n "${NCCL_P2P_DISABLE:-}" ]; then
+  case "$GPU_NAMES" in
+    *H100*|*H200*|*A100*)
+      if [ "${ALLOW_NCCL_P2P_DISABLE_ON_NVLINK:-0}" != "1" ]; then
+        echo "Refusing to run with NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE} on $GPU_NAMES. Unset it or set ALLOW_NCCL_P2P_DISABLE_ON_NVLINK=1 to override." > "$STATUS_FILE"
+        echo "$(cat "$STATUS_FILE")" >&2
+        exit 1
+      fi
+      ;;
+  esac
+  export NCCL_P2P_DISABLE
+fi
 export RAY_enable_open_telemetry=0
 export RAY_ENABLE_OPEN_TELEMETRY=0
 
 : > "$LAUNCHER_LOG"
 log_step "STEP:begin"
+log_step "STEP:env gpu_names=${GPU_NAMES:-unknown} NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-unset} NCCL_DEBUG=${NCCL_DEBUG:-unset}"
 ray stop --force >> "$LAUNCHER_LOG" 2>&1 || true
 log_step "STEP:ray_stopped"
 

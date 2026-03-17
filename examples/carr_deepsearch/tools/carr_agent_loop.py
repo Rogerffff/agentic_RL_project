@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -69,6 +70,56 @@ class CaRRToolAgentLoop(ToolAgentLoop):
             if hasattr(tool, "tool_server_url"):
                 self.tool_server_url = tool.tool_server_url
                 break
+
+        rollout_custom = self.config.actor_rollout_ref.rollout.get("custom") or {}
+        carr_budget = rollout_custom.get("carr_budget") or {}
+        self.max_rollout_wall_time_s = carr_budget.get("max_rollout_wall_time_s")
+        self.max_tool_calls = carr_budget.get("max_tool_calls")
+        self.max_search_calls = carr_budget.get("max_search_calls")
+        self.max_open_calls = carr_budget.get("max_open_calls")
+        self.max_find_calls = carr_budget.get("max_find_calls")
+
+    def _remaining_rollout_time_s(self, rollout_start: float) -> float | None:
+        if self.max_rollout_wall_time_s is None:
+            return None
+        return float(self.max_rollout_wall_time_s - (time.monotonic() - rollout_start))
+
+    def _rollout_timeout_reached(self, rollout_start: float) -> bool:
+        remaining_time = self._remaining_rollout_time_s(rollout_start)
+        return remaining_time is not None and remaining_time <= 0
+
+    def _tool_budget_termination_reason(
+        self,
+        tool_calls,
+        total_tool_calls: int,
+        search_count: int,
+        open_count: int,
+        find_count: int,
+    ) -> str | None:
+        next_total = total_tool_calls
+        next_search = search_count
+        next_open = open_count
+        next_find = find_count
+
+        for tool_call in tool_calls[:self.max_parallel_calls]:
+            next_total += 1
+            if self.max_tool_calls is not None and next_total > self.max_tool_calls:
+                return "tool_call_budget"
+
+            if tool_call.name == "browser.search":
+                next_search += 1
+                if self.max_search_calls is not None and next_search > self.max_search_calls:
+                    return "search_budget"
+            elif tool_call.name == "browser.open":
+                next_open += 1
+                if self.max_open_calls is not None and next_open > self.max_open_calls:
+                    return "open_budget"
+            elif tool_call.name == "browser.find":
+                next_find += 1
+                if self.max_find_calls is not None and next_find > self.max_find_calls:
+                    return "find_budget"
+
+        return None
 
     def _extract_completed_answer_text(self, assistant_text: str) -> str | None:
         """Return a safely trimmable final answer prefix, or ``None``.
@@ -197,6 +248,7 @@ class CaRRToolAgentLoop(ToolAgentLoop):
         pending_tool_calls = []
         turn_idx = 0
         hit_limit = False  # True if terminated by response_length / max_turns limit
+        hit_budget = False  # True if terminated by rollout wall-clock / tool budgets
         termination_reason = None
         total_tool_calls = 0
         search_count = 0
@@ -204,10 +256,18 @@ class CaRRToolAgentLoop(ToolAgentLoop):
         find_count = 0
         parse_error_count = 0
         content_early_stopped = False
+        rollout_start = time.monotonic()
 
         try:
             state = AgentState.PENDING
             while state != AgentState.TERMINATED:
+                if state in {AgentState.GENERATING, AgentState.PROCESSING_TOOLS, AgentState.INTERACTING}:
+                    if self._rollout_timeout_reached(rollout_start):
+                        hit_budget = True
+                        termination_reason = "rollout_timeout"
+                        state = AgentState.TERMINATED
+                        continue
+
                 if state == AgentState.PENDING:
                     state = await self._handle_pending_state(agent_data, sampling_params)
 
@@ -274,6 +334,19 @@ class CaRRToolAgentLoop(ToolAgentLoop):
                     parse_error_count += max(0, complete_blocks - len(agent_data.tool_calls)) + incomplete_blocks
 
                 elif state == AgentState.PROCESSING_TOOLS:
+                    budget_reason = self._tool_budget_termination_reason(
+                        agent_data.tool_calls,
+                        total_tool_calls,
+                        search_count,
+                        open_count,
+                        find_count,
+                    )
+                    if budget_reason is not None:
+                        hit_budget = True
+                        termination_reason = budget_reason
+                        state = AgentState.TERMINATED
+                        continue
+
                     # Count ACTUALLY EXECUTED tool calls (after max_parallel_calls slice)
                     executed = agent_data.tool_calls[:self.max_parallel_calls]
                     total_tool_calls += len(executed)
@@ -311,9 +384,11 @@ class CaRRToolAgentLoop(ToolAgentLoop):
 
         # Determine task_unfinished:
         # 1. Explicitly truncated by limits → always unfinished
-        # 2. Empty history or last message not assistant → unfinished (fallback)
+        # 2. Explicitly terminated by rollout/tool budgets → always unfinished
+        # 3. Empty history or last message not assistant → unfinished (fallback)
         task_unfinished = (
             hit_limit
+            or hit_budget
             or len(reward_history) == 0
             or reward_history[-1].get("role") != "assistant"
         )
@@ -349,12 +424,19 @@ class CaRRToolAgentLoop(ToolAgentLoop):
             "open_count": open_count,
             "find_count": find_count,
             "hit_limit": hit_limit,
+            "hit_budget": hit_budget,
             "parse_error_count": parse_error_count,
             "termination_reason": termination_reason,
             "termination_response_limit": 1.0 if termination_reason == "response_limit" else 0.0,
             "termination_assistant_turn_limit": 1.0 if termination_reason == "assistant_turn_limit" else 0.0,
             "termination_user_turn_limit": 1.0 if termination_reason == "user_turn_limit" else 0.0,
+            "termination_rollout_timeout": 1.0 if termination_reason == "rollout_timeout" else 0.0,
+            "termination_tool_call_budget": 1.0 if termination_reason == "tool_call_budget" else 0.0,
+            "termination_search_budget": 1.0 if termination_reason == "search_budget" else 0.0,
+            "termination_open_budget": 1.0 if termination_reason == "open_budget" else 0.0,
+            "termination_find_budget": 1.0 if termination_reason == "find_budget" else 0.0,
             "content_early_stopped": content_early_stopped,
+            "rollout_elapsed_s": float(time.monotonic() - rollout_start),
             "response_length": float(len(agent_data.response_mask)),
             "response_length_max": float(self.response_length),
             "response_length_ratio": float(len(agent_data.response_mask) / self.response_length)
