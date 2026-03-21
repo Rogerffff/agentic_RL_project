@@ -66,6 +66,8 @@ from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+# ===== KL 惩罚：防止策略偏离参考模型太远 =====
+# 计算当前策略与参考策略之间的 KL 散度，将其作为惩罚项加入 token 级别的奖励中
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -108,6 +110,11 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
+# ===== Response Mask 计算 =====
+# response_mask 标识哪些 token 属于模型的回复部分
+# 在 Agent 训练中，AgentLoopManager 会提供更精细的 response_mask：
+#   1 = LLM 生成的 token（参与梯度计算）
+#   0 = 工具/环境插入的 token（不参与梯度计算）
 def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
 
@@ -126,6 +133,9 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+# ===== 优势函数计算 =====
+# 支持多种优势估计器：GAE（PPO）、GRPO（无 Critic）、REINFORCE++ 等
+# 所有计算都会乘以 response_mask，确保只在 LLM 生成的 token 上计算优势
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -506,6 +516,9 @@ class RayPPOTrainer:
         return batch_reward
 
     def _validate(self, merged: bool = False):
+        # ===== 验证阶段 =====
+        # 验证也通过 AgentLoopManager 进行推理（self.async_rollout_manager.generate_sequences）
+        # 验证时使用 val_kwargs 中的温度和采样参数，支持多轮 Agent 交互的评估
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -807,6 +820,8 @@ class RayPPOTrainer:
         # create reward loop manager
         from verl.experimental.reward_loop import RewardLoopManager
 
+        # ===== 初始化奖励计算管理器 =====
+        # RewardLoopManager: 管理奖励模型的计算，支持流式奖励（在 rollout 过程中同步计算奖励）
         # initalize reward loop manager
         # reward model (colocate or standalone): get resource_pool
         # no reward model: resource_pool = None
@@ -816,6 +831,12 @@ class RayPPOTrainer:
             rm_resource_pool=resource_pool,
         )
 
+        # ===== 初始化 Agent Rollout 管理器（核心！） =====
+        # AgentLoopManager 是 Agent 训练的核心组件，完全接管 rollout 阶段：
+        #   - 管理多个推理引擎副本（vLLM/SGLang）用于 LLM 推理
+        #   - 管理多个 AgentLoopWorker（Ray actor）并发处理样本
+        #   - 每个样本运行 ToolAgentLoop 状态机：LLM生成 → 工具调用 → 继续生成 → ... → 终止
+        #   - 返回带有 response_mask 的 DataProto，区分 LLM token 和工具 token
         # create async rollout manager and request scheduler
         # Note: mode is always "async" since sync mode is deprecated
         self.async_rollout_mode = True
@@ -1245,6 +1266,9 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        # ===== PPO 训练主循环 =====
+        # 整体流程：加载权重 → [Rollout生成 → 计算奖励 → 计算log概率 → 计算优势 → 更新Actor/Critic → 同步权重] × N
+        # Agent 训练时，Rollout 阶段由 AgentLoopManager 接管，运行多轮工具调用的状态机
         self.global_steps = 0
 
         # load checkpoint and update weights before doing anything
@@ -1296,6 +1320,8 @@ class RayPPOTrainer:
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
+                # ===== 批次准备 =====
+                # 从数据集加载一个 batch，添加 uid 和温度等元信息
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
@@ -1314,6 +1340,12 @@ class RayPPOTrainer:
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
+                    # ===== Step 1: Rollout 生成（Agent Loop 接管点） =====
+                    # 调用 AgentLoopManager.generate_sequences()：
+                    #   - 将 batch 分发给多个 AgentLoopWorker
+                    #   - 每个 Worker 内部并发运行 ToolAgentLoop 状态机处理每个样本
+                    #   - 状态机流程：PENDING → GENERATING → PROCESSING_TOOLS → GENERATING → ... → TERMINATED
+                    #   - 返回包含 responses、response_mask（1=LLM token, 0=工具token）、log_probs 的 DataProto
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
@@ -1376,6 +1408,9 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
+                    # ===== Step 2: 计算奖励 =====
+                    # 如果启用了流式奖励（enable_agent_reward_loop），奖励已在 rollout 阶段计算完毕
+                    # 否则在这里通过 reward model 或 reward function 计算
                     self._debug_step_phase("begin", "reward")
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -1387,6 +1422,10 @@ class RayPPOTrainer:
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
                     self._debug_step_phase("end", "reward")
 
+                    # ===== Step 3: 计算 Old Log Probs（重要性采样的分母） =====
+                    # PPO 需要计算"旧策略"的 log 概率，用于重要性采样比率 π_θ/π_old
+                    # Bypass 模式：直接用 rollout 时的 log_probs（2 个策略）
+                    # Decoupled 模式：重新前向传播计算（3 个策略，更稳定）
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -1439,6 +1478,8 @@ class RayPPOTrainer:
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
+                    # ===== Step 4: 参考策略 Log Prob（KL 约束） =====
+                    # 计算冻结的参考模型的 log 概率，用于 KL 散度惩罚，防止策略漂移过远
                     if self.use_reference_policy:
                         # compute reference log_prob
                         self._debug_step_phase("begin", str(Role.RefPolicy))
@@ -1447,6 +1488,8 @@ class RayPPOTrainer:
                             batch = batch.union(ref_log_prob)
                         self._debug_step_phase("end", str(Role.RefPolicy))
 
+                    # ===== Step 5: Critic 估值（仅 PPO 需要，GRPO 不需要） =====
+                    # Critic 网络估计每个 token 的状态价值 V(s)，用于 GAE 优势计算
                     # compute values
                     if self.use_critic:
                         self._debug_step_phase("begin", "values")
@@ -1455,6 +1498,11 @@ class RayPPOTrainer:
                             batch = batch.union(values)
                         self._debug_step_phase("end", "values")
 
+                    # ===== Step 6: 计算优势函数 =====
+                    # 将奖励信号转化为优势估计 A(s,a)，指导策略更新方向
+                    # GAE: 需要 Critic 的 V(s)，适合 PPO
+                    # GRPO: 组内相对优势，无需 Critic，适合 Agent 训练
+                    # 所有优势计算都使用 response_mask，只在 LLM 生成的 token 上计算
                     self._debug_step_phase("begin", "adv")
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
@@ -1504,6 +1552,7 @@ class RayPPOTrainer:
                         )
                     self._debug_step_phase("end", "adv")
 
+                    # ===== Step 7: 更新 Critic（仅 PPO） =====
                     # update critic
                     if self.use_critic:
                         self._debug_step_phase("begin", "update_critic")
@@ -1513,6 +1562,8 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
                         self._debug_step_phase("end", "update_critic")
 
+                    # ===== Step 8: 更新 Actor（策略梯度） =====
+                    # Critic warmup 期间只更新 Critic，不更新 Actor
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
@@ -1543,6 +1594,9 @@ class RayPPOTrainer:
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
 
+                        # ===== Step 10: 同步权重到推理引擎 =====
+                        # 将训练后的新权重同步到 AgentLoopManager 管理的推理引擎副本
+                        # 下一轮 rollout 会使用更新后的策略进行生成
                         # update weights from trainer to rollout
                         self._debug_step_phase("begin", "update_weights")
                         with marked_timer("update_weights", timing_raw, color="red"):

@@ -43,14 +43,23 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+# ===== Agent 状态机状态定义 =====
+# ToolAgentLoop 通过状态机管理每个样本的多轮交互流程
 class AgentState(Enum):
-    PENDING = "pending"
-    GENERATING = "generating"
-    PROCESSING_TOOLS = "processing_tools"
-    TERMINATED = "terminated"
-    INTERACTING = "interacting"
+    PENDING = "pending"  # 初始状态：准备 apply chat template
+    GENERATING = "generating"  # LLM 推理中：生成回复 token
+    PROCESSING_TOOLS = "processing_tools"  # 执行工具调用：运行工具并收集结果
+    TERMINATED = "terminated"  # 终止：达到最大轮数或最大长度
+    INTERACTING = "interacting"  # 环境交互：等待环境反馈（非工具调用）
 
 
+# ===== Agent 数据状态封装 =====
+# 每个样本在整个多轮交互过程中的完整状态，关键字段：
+#   - messages: 完整的对话历史（用于 apply chat template）
+#   - prompt_ids: 累积的 token 序列（prompt + 所有轮次的 response）用于 prefix cache
+#   - response_mask: 标记每个 response token 的来源（1=LLM生成, 0=工具/环境插入）
+#   - tool_calls: 当前轮次提取的工具调用列表
+#   - turn_scores/tool_rewards: 交互级/工具级的奖励信号
 class AgentData:
     """Encapsulates all state variables for the agent loop. AgentData is passed to tool calling in case that
     tool may need to access full history state. User can store any tool session data in `extra_fields`."""
@@ -94,6 +103,11 @@ class AgentData:
         self.extra_fields: dict[str, Any] = {}
 
 
+# ===== 工具 Agent Loop（核心状态机实现） =====
+# 多轮 Agent 训练的核心组件，通过状态机管理 LLM 生成 ↔ 工具调用 的交替过程
+# 状态转移: PENDING → GENERATING → PROCESSING_TOOLS → GENERATING → ... → TERMINATED
+#                                  ↘ INTERACTING → GENERATING ↗
+# 每轮生成时，LLM token 标记 response_mask=1，工具/环境 token 标记 response_mask=0
 @register("tool_agent")
 class ToolAgentLoop(AgentLoopBase):
     def __init__(
@@ -135,6 +149,13 @@ class ToolAgentLoop(AgentLoopBase):
                 self.interaction_config_file
             )
 
+    # ===== 状态机主循环 =====
+    # 对每个样本执行完整的多轮交互：
+    #   1. PENDING: 初始化 → apply chat template → 转入 GENERATING
+    #   2. GENERATING: LLM 推理 → 提取 tool_call → 根据是否有工具调用决定下一状态
+    #   3. PROCESSING_TOOLS: 并行执行工具 → 工具结果 tokenize 并标记 mask=0 → 回到 GENERATING
+    #   4. INTERACTING: 获取环境反馈 → 反馈 tokenize 并标记 mask=0 → 回到 GENERATING 或 TERMINATED
+    #   5. TERMINATED: 组装最终的 AgentLoopOutput
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
@@ -214,6 +235,7 @@ class ToolAgentLoop(AgentLoopBase):
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
         return output
 
+    # 初始状态处理：将初始消息列表转为 token 序列（apply chat template）
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
         prompt_ids = await self.apply_chat_template(
@@ -225,6 +247,8 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.prompt_ids = prompt_ids
         return AgentState.GENERATING
 
+    # 生成状态处理：调用 LLM 推理，生成的 token 标记 response_mask=1
+    # 推理完成后检查：是否超长/超轮次 → TERMINATED；有工具调用 → PROCESSING_TOOLS；否则 → TERMINATED/INTERACTING
     async def _handle_generating_state(
         self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
     ) -> AgentState:
@@ -283,6 +307,8 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             return AgentState.TERMINATED
 
+    # 工具处理状态：并行执行工具调用，工具返回结果 tokenize 后标记 response_mask=0
+    # 工具可以返回奖励信号（tool_reward），用于细粒度的奖励塑造
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""
         add_messages: list[dict[str, Any]] = []
@@ -382,6 +408,8 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.user_turns += 1
         return AgentState.GENERATING
 
+    # 环境交互状态：获取环境（BaseInteraction）的反馈，反馈 token 标记 response_mask=0
+    # 环境可以决定是否终止对话（should_terminate）并返回轮次级奖励
     async def _handle_interacting_state(self, agent_data: AgentData) -> AgentState:
         """Handle the interacting state: get user input from interaction."""
         (

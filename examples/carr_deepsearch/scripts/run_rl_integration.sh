@@ -38,8 +38,8 @@ if [ -f "$HOME/.env" ]; then
   set +a
 fi
 
-if [ -z "${SERPER_API_KEY:-}" ] && [ -z "${SERPAPI_API_KEY:-}" ]; then
-  echo "missing search api key" > "$STATUS_FILE"
+if [ -z "${SERPER_API_KEY:-}" ]; then
+  echo "missing SERPER_API_KEY" > "$STATUS_FILE"
   exit 1
 fi
 : "${JINA_API_KEY:?Must set JINA_API_KEY}"
@@ -51,6 +51,11 @@ export CARR_REWARD_TIMEOUT="${CARR_REWARD_TIMEOUT:-650}"
 export CARR_REWARD_TRACE_LOG=1
 export CARR_REWARD_TRACE_LOG_PATH="$TRACE_LOG"
 export CARR_TOOL_CLIENT_TIMEOUT_S="${CARR_TOOL_CLIENT_TIMEOUT_S:-120}"
+export CARR_SERPAPI_SEARCH_CONCURRENCY_LIMIT="${CARR_SERPAPI_SEARCH_CONCURRENCY_LIMIT:-${CARR_SEARCH_CONCURRENCY_LIMIT:-4}}"
+export CARR_SERPER_SEARCH_CONCURRENCY_LIMIT="${CARR_SERPER_SEARCH_CONCURRENCY_LIMIT:-0}"
+export CARR_SEARCH_BACKOFF_BASE_S="${CARR_SEARCH_BACKOFF_BASE_S:-0.5}"
+export CARR_SEARCH_BACKOFF_MAX_S="${CARR_SEARCH_BACKOFF_MAX_S:-8.0}"
+export CARR_SEARCH_BACKOFF_JITTER_S="${CARR_SEARCH_BACKOFF_JITTER_S:-0.25}"
 
 GPU_NAMES="$(detect_gpu_names)"
 # Some Blackwell setups require explicitly disabling NCCL P2P, but the NVLink hosts
@@ -72,7 +77,7 @@ export RAY_ENABLE_OPEN_TELEMETRY=0
 
 : > "$LAUNCHER_LOG"
 log_step "STEP:begin"
-log_step "STEP:env gpu_names=${GPU_NAMES:-unknown} NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-unset} NCCL_DEBUG=${NCCL_DEBUG:-unset}"
+log_step "STEP:env gpu_names=${GPU_NAMES:-unknown} NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-unset} NCCL_DEBUG=${NCCL_DEBUG:-unset} SEARCH_BACKEND=serper SERPAPI_SEARCH_CONCURRENCY=${CARR_SERPAPI_SEARCH_CONCURRENCY_LIMIT} SERPER_SEARCH_CONCURRENCY=${CARR_SERPER_SEARCH_CONCURRENCY_LIMIT} SEARCH_BACKOFF_BASE_S=${CARR_SEARCH_BACKOFF_BASE_S} SEARCH_BACKOFF_MAX_S=${CARR_SEARCH_BACKOFF_MAX_S} SEARCH_BACKOFF_JITTER_S=${CARR_SEARCH_BACKOFF_JITTER_S}"
 ray stop --force >> "$LAUNCHER_LOG" 2>&1 || true
 log_step "STEP:ray_stopped"
 
@@ -89,11 +94,8 @@ trap cleanup EXIT
 
 cd "$PROJECT_DIR"
 
-if [ -n "${SERPER_API_KEY:-}" ]; then
-  SEARCH_ARGS=(--search_backend serper --serper_api_key "$SERPER_API_KEY")
-else
-  SEARCH_ARGS=(--serp_api_key "$SERPAPI_API_KEY")
-fi
+unset SERPAPI_API_KEY
+SEARCH_ARGS=(--search_backend serper --serper_api_key "$SERPER_API_KEY")
 
 python "$PROJECT_DIR/CaRR/tool_server/launch_server.py" \
   "${SEARCH_ARGS[@]}" \

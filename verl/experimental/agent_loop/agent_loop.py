@@ -53,6 +53,11 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+# ===== 异步 LLM 服务器管理器 =====
+# 管理多个推理引擎副本，提供：
+#   - 最少请求负载均衡：用最小堆跟踪每个服务器的请求数，优先选择负载最低的服务器
+#   - 粘性会话：同一个 request_id 总是路由到同一台服务器，利用 prefix cache 加速多轮对话
+#   - 异步生成接口：返回 TokenOutput（包含 token_ids, log_probs 等）
 class AsyncLLMServerManager:
     """
     A class to manage multiple OpenAI compatible LLM servers. This class provides
@@ -79,6 +84,7 @@ class AsyncLLMServerManager:
         # LRU cache to map request_id to server
         self.request_id_to_server = LRUCache(maxsize=max_cache_size)
 
+    # 选择服务器：优先返回粘性会话缓存中的服务器，否则选负载最低的（最小堆）
     def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
         # TODO: implement server pressure awareness load balancing
         if request_id in self.request_id_to_server:
@@ -90,6 +96,7 @@ class AsyncLLMServerManager:
         self.request_id_to_server[request_id] = server
         return server
 
+    # 异步生成：路由到合适的服务器，返回 TokenOutput（token_ids + log_probs）
     @rollout_trace_op
     async def generate(
         self,
@@ -129,6 +136,13 @@ class AgentLoopMetrics(BaseModel):
     num_preempted: int = -1  # -1 means not available
 
 
+# ===== Agent Loop 输出数据结构 =====
+# 每个样本经过 Agent Loop 后产生的输出，包含：
+#   - prompt_ids: 原始提示 token（含系统提示和用户消息）
+#   - response_ids: 回复 token（包含 LLM 生成 + 工具结果的混合序列）
+#   - response_mask: 关键！1=LLM生成的token（参与RL训练），0=工具/环境插入的token（不参与训练）
+#   - response_logprobs: 每个 token 的 log 概率（仅 LLM 生成的 token 有效）
+#   - num_turns: 总对话轮数
 class AgentLoopOutput(BaseModel):
     """Agent loop output."""
 
@@ -188,6 +202,13 @@ class DictConfigWrap:
         self.config = config
 
 
+# ===== Agent Loop 抽象基类 =====
+# 所有 Agent Loop 实现（ToolAgentLoop、SingleTurnAgentLoop 等）的基类
+# 核心职责：
+#   - 管理与 AsyncLLMServerManager 的交互
+#   - 处理 chat template 和 Delta-based Tokenization
+#   - 定义 run() 抽象方法，子类实现具体的状态机逻辑
+# 通过 @register 装饰器注册到全局注册表，数据集中的 agent_name 字段决定使用哪个实现
 class AgentLoopBase(ABC):
     """An agent loop takes an input message, chat with OpenAI compatible LLM server and interact with various
     environments."""
@@ -243,6 +264,10 @@ class AgentLoopBase(ABC):
 
         return multi_modal_data
 
+    # ===== Delta-based Tokenization =====
+    # 将消息列表转为 token 序列。在多轮场景中用于计算"增量 token"：
+    # 新一轮的 token = apply_chat_template(new_messages) - 已有的 token
+    # 这样确保 token 化的一致性，避免 decode-encode 不可逆带来的训练崩溃
     async def apply_chat_template(
         self,
         messages: list[dict],
@@ -308,6 +333,9 @@ class AgentLoopBase(ABC):
 
         return prompt_ids
 
+    # 核心抽象方法：子类实现具体的 Agent 交互逻辑（如 ToolAgentLoop 的状态机）
+    # 输入：采样参数 + 数据集字段（messages, tools_kwargs 等）
+    # 输出：AgentLoopOutput（包含完整的多轮对话 token 序列和 response_mask）
     @abstractmethod
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         """Run agent loop to interact with LLM server and environment.
@@ -341,6 +369,13 @@ def register(agent_name: str):
     return decorator
 
 
+# ===== Agent Loop Worker（Ray Actor） =====
+# 每个 Worker 是一个 Ray 远程 actor，负责：
+#   1. 接收一个 batch 的 DataProto
+#   2. 为每个样本选择对应的 AgentLoop 实现（通过 agent_name 路由）
+#   3. 并发运行所有样本的 Agent Loop（asyncio.gather）
+#   4. 将 AgentLoopOutput 转换为带 padding 的张量，组装成 DataProto 返回
+# Worker 数量通过 config.actor_rollout_ref.rollout.agent.num_workers 配置
 class AgentLoopWorker:
     """Agent loop worker takes a batch of messages and run each message in an agent loop."""
 
@@ -391,6 +426,10 @@ class AgentLoopWorker:
             trace_config.get("max_samples_per_step_per_worker", None),
         )
 
+    # ===== 批量生成入口 =====
+    # 接收 DataProto batch，为每个样本创建 asyncio task 并发运行 Agent Loop
+    # 每个样本根据 agent_name 路由到对应的 AgentLoop 实现
+    # 返回聚合后的 DataProto（包含所有样本的 responses, response_mask 等）
     @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -722,6 +761,11 @@ class AgentLoopWorker:
             output.reward_score = result["reward_score"]
             output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
 
+    # ===== 批次后处理 =====
+    # 将所有样本的 _InternalAgentLoopOutput 聚合为一个 DataProto：
+    #   - 堆叠所有张量（prompts, responses, response_mask, attention_mask 等）
+    #   - 合并非张量数据（__num_turns__, reward_extra_keys 等）
+    #   - 如果有流式奖励分数，放入 rm_scores 张量
     def _postprocess(
         self,
         inputs: list[_InternalAgentLoopOutput],
@@ -850,6 +894,13 @@ async def get_trajectory_info(step, index, validate):
     return trajectory_info
 
 
+# ===== Agent Loop 管理器（顶层编排器） =====
+# 被 RayPPOTrainer 持有（self.async_rollout_manager），是 trainer 调用 rollout 的唯一入口
+# 职责：
+#   1. 初始化推理引擎副本（RolloutReplica）：管理 vLLM/SGLang 服务器实例
+#   2. 初始化 AgentLoopWorker 池：创建多个 Ray actor 并行处理样本
+#   3. generate_sequences()：将 batch 分片 → 分发给 Worker → 聚合结果 → 返回 DataProto
+# 架构: AgentLoopManager → [AgentLoopWorker₁, Worker₂, ...] → [RolloutReplica₁, Replica₂, ...]
 class AgentLoopManager:
     """Agent loop manager that manages a group of agent loop workers."""
 
@@ -946,6 +997,9 @@ class AgentLoopManager:
                 ).remote(self.config, self.server_handles, self.reward_loop_worker_handles)
             )
 
+    # ===== 生成序列（Trainer 的 rollout 入口） =====
+    # 被 RayPPOTrainer.fit() 中 self.async_rollout_manager.generate_sequences() 调用
+    # 流程：将 batch 均匀分片 → 分发给各 Worker 并行处理 → ray.get 等待完成 → 合并结果
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
 

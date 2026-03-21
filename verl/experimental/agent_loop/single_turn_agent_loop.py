@@ -25,6 +25,11 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+# ===== 单轮 Agent Loop（默认 fallback） =====
+# 简单的单轮问答实现，无状态机、无工具调用
+# 当数据集中的 agent_name 为 "single_turn_agent" 或未指定时使用
+# 流程：apply chat template → LLM 推理 → 直接返回 AgentLoopOutput
+# response_mask 全为 1（所有 token 都是 LLM 生成的）
 @register("single_turn_agent")
 class SingleTurnAgentLoop(AgentLoopBase):
     """Naive agent loop that only do single turn chat completion."""
@@ -41,6 +46,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             for tool in tool_list
         ]
 
+    # 单轮生成：直接调用 LLM 推理，不涉及工具调用或多轮交互
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
 

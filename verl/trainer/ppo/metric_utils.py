@@ -248,8 +248,23 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             vals = batch.non_tensor_batch[key]
             metrics[f"{key}/mean"] = float(np.mean(vals))
 
-    # Boolean-like metrics
-    for key in ["task_unfinished", "hit_limit"]:
+    # Boolean-like metrics emitted from custom agent loops / reward pass-through.
+    # These are stored as 0/1 floats in non_tensor_batch and should surface as
+    # per-step ratios in W&B, not disappear silently.
+    for key in [
+        "task_unfinished",
+        "hit_limit",
+        "hit_budget",
+        "content_early_stopped",
+        "termination_response_limit",
+        "termination_assistant_turn_limit",
+        "termination_user_turn_limit",
+        "termination_rollout_timeout",
+        "termination_tool_call_budget",
+        "termination_search_budget",
+        "termination_open_budget",
+        "termination_find_budget",
+    ]:
         if key in batch.non_tensor_batch:
             vals = batch.non_tensor_batch[key]
             metrics[f"{key}/ratio"] = float(np.mean(vals))
@@ -257,6 +272,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     if "parse_error_count" in batch.non_tensor_batch:
         vals = batch.non_tensor_batch["parse_error_count"]
         metrics["parse_error_count/mean"] = float(np.mean(vals))
+
+    for key in ["rollout_elapsed_s", "response_length_ratio"]:
+        if key in batch.non_tensor_batch:
+            vals = batch.non_tensor_batch[key]
+            metrics[f"{key}/mean"] = float(np.mean(vals))
 
     return metrics
 

@@ -486,6 +486,17 @@ bash examples/carr_deepsearch/scripts/run_rl.sh \
 - OOM → 降低 `data.max_response_length`（默认 61440→32768）或 `actor_rollout_ref.actor.ppo_max_token_len_per_gpu`
 - Tool server 报错 → 检查 Serper/Jina API key 有效性
 
+**64k RL 额外硬规则（2026-03-17 新增）**:
+
+- 当 `data.max_prompt_length=4096` 且 `data.max_response_length=61440` 时，PPO 更新阶段看到的单条最大序列长度会到 `65536`
+- 这时 `actor_rollout_ref.actor.ppo_max_token_len_per_gpu` 必须 `>= 65536`
+- 如果仍保留默认/较小值（例如 `24576`），`update_actor` 会直接报：
+  `AssertionError: max_token_len must be greater than the sequence length. Got max_token_len=24576 and max_seq_len=65536`
+- `rollout.log_prob_max_token_len_per_gpu` 和 `ref.log_prob_max_token_len_per_gpu` 只影响 `old_log_prob/ref_log_prob`，**不能**解决这个 `update_actor` 断言
+- 因此后续凡是跑 `64k RL probe`，必须二选一：
+  - 保持 `data.max_response_length=61440`，并把 `actor_rollout_ref.actor.ppo_max_token_len_per_gpu` 提到 `70000`
+  - 或直接降低 `data.max_response_length`，而不是只调 `log_prob_max_token_len_per_gpu`
+
 **产物来源**:
 - training-step 指标：来自 WandB run `carr_deepsearch / carr-cgrpo-dryrun-chain` 的最后一个 step 或 console 日志。
 - validation metrics：来自同一 run 的 validation panel / console validation summary。

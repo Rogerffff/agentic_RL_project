@@ -703,3 +703,38 @@ bash run_eval_browsecomp.sh <cgrpo_ckpt> -1 64k
 | `verl/experimental/agent_loop/tool_agent_loop.py` | ToolAgentLoop 基类（理解状态机） |
 | `verl/trainer/ppo/core_algos.py` | GRPO 优势估计器基础 |
 | `verl/experimental/reward_loop/reward_manager/naive.py` | NaiveRewardManager 调用链 |
+
+---
+
+## 十、2026-03-17 Blackwell RL Probe 补充结论
+
+在 `4 x RTX PRO 6000 (96GB)` 上做 `b4/n4, TP1, 64k RL` probe 时，出现过一次非常容易误判的失败：
+
+- 训练并不是卡死在 `rollout` 或 `old_log_prob`
+- 真正报错点在 `update_actor`
+- 具体断言为：
+
+```text
+AssertionError: max_token_len must be greater than the sequence length.
+Got max_token_len=24576 and max_seq_len=65536
+```
+
+根因：
+
+- `data.max_prompt_length=4096`
+- `data.max_response_length=61440`
+- 因此单条样本的实际最大序列长度可以到 `65536`
+- 但当时 `actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24576`
+- `update_actor` 的 dynamic batching 直接触发断言
+
+容易犯错的点：
+
+- 这不是 `rollout.log_prob_max_token_len_per_gpu` 或 `ref.log_prob_max_token_len_per_gpu` 的问题
+- 那两个参数只影响 `old_log_prob/ref_log_prob`
+- 即使把它们调高到 `70000`，如果 `actor.ppo_max_token_len_per_gpu` 仍小于实际 `max_seq_len`，`update_actor` 还是会炸
+
+后续固定规则：
+
+- 只要继续跑 `64k RL`，`actor_rollout_ref.actor.ppo_max_token_len_per_gpu` 就必须 `>= 65536`
+- 当前推荐直接设 `70000`
+- 如果显存预算不允许，就先降 `data.max_response_length`，不要再只调 `log_prob_max_token_len_per_gpu`
