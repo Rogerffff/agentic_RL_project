@@ -69,12 +69,11 @@ class CaRRSessionManager:
 
     async def close(self, session_id: str, tool_server_url: str):
         """Close a session and clean up tracking state."""
-        if session_id in self._started_sessions:
-            ok, _ = await self.call_server(tool_server_url, session_id, "close_session", {}, {})
-            if not ok:
-                logger.warning("close_session failed for %s", session_id)
-            self._started_sessions.discard(session_id)
-            self._session_data.pop(session_id, None)
+        ok, _ = await self.call_server(tool_server_url, session_id, "close_session", {}, {})
+        if not ok:
+            logger.warning("close_session failed for %s", session_id)
+        self._started_sessions.discard(session_id)
+        self._session_data.pop(session_id, None)
 
     def get_session_data(self, session_id: str) -> Dict[str, Any]:
         return self._session_data.get(session_id, {})

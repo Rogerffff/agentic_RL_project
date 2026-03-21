@@ -14,6 +14,7 @@
 
 import asyncio
 import functools
+import hashlib
 import multiprocessing
 import os
 import time
@@ -281,6 +282,53 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.validate_task = asyncio.create_task(
                 self.do_validate_async(timing_raw, version, global_steps, use_trainer_do_validate)
             )
+
+    async def probe_rollout_logprobs(
+        self,
+        raw_prompt: list[dict],
+        sampling_params_override: dict | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, object]:
+        if self.async_rollout_manager is None:
+            await self._init_async_rollout_manager()
+
+        sample = DataProto.from_dict(
+            non_tensors={
+                "raw_prompt": np.array([list(raw_prompt)], dtype=object),
+                "agent_name": np.array(
+                    [
+                        agent_name
+                        or (
+                            (self.config.actor_rollout_ref.rollout.get("custom") or {}).get(
+                                "fully_async_agent_loop_name", "async_partial_tool_agent"
+                            )
+                            if self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            else "partial_single_turn_agent"
+                        )
+                    ],
+                    dtype=object,
+                ),
+                "tools_kwargs": np.array([{}], dtype=object),
+                "extra_info": np.array([{}], dtype=object),
+            },
+            meta_info={
+                "validate": False,
+                "global_steps": self.global_steps,
+                "sampling_params_override": sampling_params_override or {},
+            },
+        )
+        output, is_cancel = await self.async_rollout_manager.generate_single_sample_async(sample, [None])
+        if is_cancel:
+            raise RuntimeError("rollout logprob probe was interrupted by a partial cancel")
+
+        response_mask = output.batch["response_mask"][0].to(dtype=torch.bool)
+        rollout_log_probs = output.batch["rollout_log_probs"][0][response_mask].detach().cpu().to(dtype=torch.float32)
+        hasher = hashlib.sha256()
+        hasher.update(rollout_log_probs.numpy().tobytes())
+        return {
+            "digest": hasher.hexdigest(),
+            "num_logprobs": int(rollout_log_probs.numel()),
+        }
 
     def _validate_wrapper(
         self, timing_raw: dict, version: int, global_steps: int = 0, use_trainer_do_validate: bool = False

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import hashlib
 import logging
 import os
 import threading
@@ -42,6 +43,7 @@ class BaseDetachNcclSync:
             target=self._start_background_loop, args=(self._bg_loop,), name="rollout_actor_async_worker", daemon=True
         )
         self._bg_thread.start()
+        self._last_sync_fingerprint = None
         logger.info(f"[DetachNcclSync] Background thread for SGLang sync started. PID: {os.getpid()}")
 
     @classmethod
@@ -165,11 +167,62 @@ class BaseDetachNcclSync:
             )
         return inference_model
 
+    def _new_sync_fingerprint_state(self):
+        return {
+            "hasher": hashlib.sha256(),
+            "tensor_count": 0,
+            "sampled_tensor_count": 0,
+            "total_numel": 0,
+        }
+
+    def _should_sample_tensor_for_fingerprint(self, tensor_idx: int, total_tensors: int) -> bool:
+        return tensor_idx < 16 or tensor_idx == total_tensors - 1 or tensor_idx % 17 == 0
+
+    def _update_sync_fingerprint(self, state: dict, tensor_idx: int, key: str, tensor: torch.Tensor, total_tensors: int):
+        hasher = state["hasher"]
+        hasher.update(key.encode("utf-8"))
+        hasher.update(str(tuple(tensor.shape)).encode("utf-8"))
+        hasher.update(str(tensor.dtype).encode("utf-8"))
+        state["tensor_count"] += 1
+        state["total_numel"] += int(tensor.numel())
+
+        if not self._should_sample_tensor_for_fingerprint(tensor_idx, total_tensors):
+            return
+
+        state["sampled_tensor_count"] += 1
+        flat = tensor.detach().reshape(-1)
+        if flat.numel() == 0:
+            hasher.update(b"empty")
+            return
+
+        head = flat[: min(8, flat.numel())]
+        tail = flat[max(0, flat.numel() - 8) :]
+        probe = torch.cat([head, tail], dim=0)
+        if probe.is_floating_point():
+            probe = probe.to(dtype=torch.float32)
+        else:
+            probe = probe.to(dtype=torch.int64)
+        hasher.update(probe.to(device="cpu", non_blocking=False).numpy().tobytes())
+
+    def _finalize_sync_fingerprint(self, state: dict):
+        self._last_sync_fingerprint = {
+            "digest": state["hasher"].hexdigest(),
+            "tensor_count": state["tensor_count"],
+            "sampled_tensor_count": state["sampled_tensor_count"],
+            "total_numel": state["total_numel"],
+        }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=True)
+    def get_last_sync_fingerprint(self):
+        return self._last_sync_fingerprint
+
     def _sync_sglang_weights(self, inference_model, params, sync_group_name):
         bucket_size_bytes = int(self.get_bucket_size_mb() * 1024 * 1024)
         actual_bucket_sizes = []
         current_batch = []
         current_batch_size = 0
+        fingerprint_state = self._new_sync_fingerprint_state()
+        total_tensors = len(self._weights_info)
 
         def flush_batch():
             if current_batch:
@@ -178,7 +231,7 @@ class BaseDetachNcclSync:
                 get_torch_device().synchronize()
                 current_batch.clear()
 
-        for key, shape, dtype in self._weights_info:
+        for tensor_idx, (key, shape, dtype) in enumerate(self._weights_info):
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
             if self._is_actor:
                 assert key in params
@@ -188,6 +241,7 @@ class BaseDetachNcclSync:
                 if torch.distributed.get_rank() == 0:
                     tensor.copy_(origin_data)
             collective.broadcast(tensor, src_rank=0, group_name=sync_group_name)
+            self._update_sync_fingerprint(fingerprint_state, tensor_idx, key, tensor, total_tensors)
 
             tensor_size = tensor.numel() * tensor.element_size()
             current_batch.append((key, tensor))
@@ -202,13 +256,16 @@ class BaseDetachNcclSync:
         cls._last_avg_bucket_size = (
             sum(actual_bucket_sizes) / len(actual_bucket_sizes) if actual_bucket_sizes else self.get_bucket_size_mb()
         )
+        self._finalize_sync_fingerprint(fingerprint_state)
 
         # Resume kv_cache after weights sync to restore GPU memory released during pause
         if self._is_rollout and self.rollout_device_mesh["infer_tp"].get_local_rank() == 0:
             self._run_async_safely(inference_model.resume_memory_occupation(tags=["kv_cache"]))
 
     def _sync_vllm_weights(self, inference_model, params, sync_group_name):
-        for key, shape, dtype in self._weights_info:
+        fingerprint_state = self._new_sync_fingerprint_state()
+        total_tensors = len(self._weights_info)
+        for tensor_idx, (key, shape, dtype) in enumerate(self._weights_info):
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
             if self._is_actor:
                 assert key in params
@@ -221,8 +278,10 @@ class BaseDetachNcclSync:
                 self._weight_sync_group.broadcast(tensor, src=0, stream=get_torch_device().current_stream())
             else:
                 collective.broadcast(tensor, src_rank=0, group_name=sync_group_name)
+            self._update_sync_fingerprint(fingerprint_state, tensor_idx, key, tensor, total_tensors)
             if self._is_rollout:
                 inference_model.load_weights([(key, tensor)])
+        self._finalize_sync_fingerprint(fingerprint_state)
 
     async def update_weights(self, inference_engine, params):
         from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
