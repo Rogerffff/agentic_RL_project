@@ -30,14 +30,17 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
-from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.sglang_rollout.http_server_engine import AsyncHttpServerAdapter
-from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
+from verl.workers.rollout.sglang_rollout.utils import (
+    ensure_sglang_flush_cache_succeeded,
+    get_named_tensor_buckets,
+    update_sglang_weights_no_flush,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -211,7 +214,7 @@ class ServerAdapter(BaseRollout):
             weights = weights
 
         async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
-            await sgl_update_weights(
+            await update_sglang_weights_no_flush(
                 engine=self._engine,
                 params_batch=params_batch,
                 device_mesh_key="infer_tp",
@@ -219,4 +222,5 @@ class ServerAdapter(BaseRollout):
             )
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
-            await self._engine.flush_cache()
+            flush_response = await self._engine.flush_cache()
+            ensure_sglang_flush_cache_succeeded(flush_response, "standalone rollout post-sync validation")

@@ -1,10 +1,10 @@
 hydra:
   searchpath:
     - file://verl/trainer/config
-    - file://verl/experimental/fully_async_policy/config
 
 defaults:
-  - carr_grpo_async_base
+  - ppo_trainer
+  - carr_grpo_async_common
   - _self_
 
 data:
@@ -14,6 +14,7 @@ actor_rollout_ref:
   actor:
     ppo_max_token_len_per_gpu: 24576
   rollout:
+    free_cache_engine: false
     multi_turn:
       enable: true
       format: hermes
@@ -37,6 +38,8 @@ actor_rollout_ref:
 async_training:
   staleness_threshold: 0.0
   partial_rollout: false
+  max_concurrent_samples: null
+  max_queue_size: null
   checkpoint_engine:
     enable: false
 
@@ -45,11 +48,28 @@ algorithm:
   cgrpo_alpha: 0.3
 
 reward:
+  reward_model:
+    enable: false
   custom_reward_function:
     path: examples/carr_deepsearch/reward/carr_reward.py
     name: compute_score
 
 trainer:
+  nnodes: 1
+  n_gpus_per_node: 4
+  total_epochs: 1
+  save_freq: 0
+  test_freq: 0
+  project_name: carr_deepsearch
+  logger: ['console', 'wandb']
   experiment_name: carr-async-sync-stream
   default_local_dir: ${oc.env:HOME}/checkpoints/carr_deepsearch_async
   validation_data_dir: ${oc.env:HOME}/eval_results/carr_deepsearch_async
+
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 4
+  n: ${actor_rollout_ref.rollout.n}
+  total_rollout_steps: 32
+  total_epochs: 1
+  test_freq: 0

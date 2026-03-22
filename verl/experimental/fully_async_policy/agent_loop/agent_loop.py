@@ -40,6 +40,7 @@ from verl.utils.rollout_trace import (
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ASYNC_DEBUG_PARTIAL = os.getenv("VERL_ASYNC_DEBUG_PARTIAL", "0") == "1"
 
 
 class FullyAsyncLLMServerManager(AsyncLLMServerManager):
@@ -204,6 +205,14 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
                 output: AgentLoopOutput = await agent_loop.run(
                     sampling_params, cancellation_event=self.cancellation_event, **kwargs
                 )
+                if ASYNC_DEBUG_PARTIAL:
+                    print(
+                        "[FullyAsyncAgentLoop][DebugPartial] "
+                        f"sample_index={trajectory['sample_index']} "
+                        f"is_cancel={output.extra_fields.get('is_cancel', False)} "
+                        f"param_version_start={output.extra_fields.get('param_version_start')} "
+                        f"param_version_end={output.extra_fields.get('param_version_end')}"
+                    )
                 if not output.extra_fields.get("is_cancel", False):
                     kwargs.pop("output", None)
                     output = await self._agent_loop_postprocess(output, **kwargs)

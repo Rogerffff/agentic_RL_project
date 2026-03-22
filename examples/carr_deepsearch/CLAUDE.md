@@ -30,6 +30,23 @@ export SFT_MODEL_PATH=/abs/path/to/sft_checkpoint/huggingface
 bash examples/carr_deepsearch/scripts/run_rl.sh \
   actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
   actor_rollout_ref.ref.fsdp_config.model_dtype=bf16
+
+# Async RL short run / probe（当前正式 async short run 的推荐入口）
+export SERPER_API_KEY=...        # 或 SERPAPI_API_KEY=...
+export JINA_API_KEY=...
+export DEEPSEEK_API_KEY=...
+export WANDB_API_KEY=...
+export SFT_MODEL_PATH=/abs/path/to/actor_or_sft_huggingface
+export NCCL_P2P_DISABLE=1
+export VERL_USE_EXTERNAL_MODULES=examples.carr_deepsearch.tools.carr_agent_loop,examples.carr_deepsearch.reward.cgrpo_advantage
+ASYNC_PROFILE=async_partial \
+ASYNC_TRIGGER_SYNC_STEP=2 \
+ASYNC_STALENESS=1.0 \
+ASYNC_MAX_CONCURRENT_SAMPLES=12 \
+ASYNC_MAX_QUEUE_SIZE=12 \
+TRAIN_GPUS=4 \
+ROLLOUT_GPUS=4 \
+bash examples/carr_deepsearch/scripts/run_rl_async.sh
 ```
 
 ## 外部 API 依赖
@@ -52,21 +69,25 @@ bash examples/carr_deepsearch/scripts/run_rl.sh \
 |------|------|
 | `carr_sft.yaml` | SFT 冷启动配置。模型 Qwen/Qwen3-4B，multiturn SFT，max_length=65536，3 epochs |
 | `carr_grpo.yaml` | C-GRPO RL 配置。train_batch_size=128, rollout.n=16, max_response_length=61440, adv_estimator=cgrpo, cgrpo_alpha=0.3 |
+| `carr_grpo_async_common.yaml` | async RL 共用配置。强制 `train_batch_size=0`、`gen_batch_size=1`、`hybrid_engine=false`，并在 async probe 下关闭 `actor.use_dynamic_bsz` |
+| `carr_grpo_async_base.yaml` | fully-async 基座 probe 配置。`multi_turn.enable=false`，使用本地 dummy reward，只验证 async 基座和 param sync |
+| `carr_grpo_async.yaml` | CaRR async RL 配置。启用 multi-turn、`carr_async_partial_tool_agent`、async budgets、`max_concurrent_samples/max_queue_size` 覆盖 |
 | `tool_config/carr_browser_tools.yaml` | 三个浏览器工具的 schema 定义（SFT + RL 唯一真值）。建议保持稳定 key 顺序；最终一致性由 `normalize_tool_schema()` 保证 |
 
 ### tools/ — Agent 工具与会话管理
 
 | 文件 | 说明 |
 |------|------|
-| `carr_agent_loop.py` | 自定义 AgentLoop，继承 ToolAgentLoop。注册名 `carr_tool_agent`。维护 CaRR 格式的 reward_history（含 tool_call_id），在 finally 中关闭工具服务器 session |
+| `carr_agent_loop.py` | 自定义 AgentLoop，继承 ToolAgentLoop。同步路径注册 `carr_tool_agent`；async 路径注册 `carr_async_partial_tool_agent`。后者持久化 reward_history、budget、pending_tool_calls、assistant turn buffer，并支持 cancel/resume |
 | `carr_browser_tool.py` | BaseTool 适配器，三个工具共用一个类（按 self.name 区分）。转换参数类型（如 open.id str→int），提取 search_forbidden_strs，委托 CaRRSessionManager 管理 session |
-| `carr_session_manager.py` | 单例 session 管理器。每个 request_id 一个 session，惰性启动（首次工具调用时 start_session），agent 结束时 close_session |
+| `carr_session_manager.py` | 单例 session 管理器。每个 request_id 一个 session，惰性启动（首次工具调用时 start_session），并在 async cancel/resume 跨 worker 时保持最终幂等 `close_session` |
 
 ### reward/ — 奖励函数与优势估计
 
 | 文件 | 说明 |
 |------|------|
 | `carr_reward.py` | 异步奖励函数，由 NaiveRewardManager 调用。发送 agent history 到奖励服务器 `/evaluate`，返回 {score, outcome_reward, rubric_reward}。env: `CARR_REWARD_SERVER_URL`, `CARR_REWARD_TIMEOUT` |
+| `async_base_reward.py` | fully-async 基座 probe 的本地 dummy reward。只依赖 `solution_str`，不访问外部服务，用来验证 async trainer/rollouter/param sync 主链路 |
 | `cgrpo_advantage.py` | C-GRPO 优势估计器，注册名 `cgrpo`。融合公式: `R = (1-α)*R_outcome + α*R_outcome*R̂_rubric`，α=0.3。组内归一化 rubric 后融合，重建 token_level_rewards |
 
 ### data_preprocess/ — 数据预处理脚本
@@ -93,6 +114,8 @@ bash examples/carr_deepsearch/scripts/run_rl.sh \
 |------|------|
 | `run_sft.sh` | SFT 一键训练（含数据预处理 + torchrun） |
 | `run_rl.sh` | RL 一键训练（启动工具/奖励服务器 + main_ppo）。支持 Serper/SerpAPI 双后端 |
+| `run_rl_async.sh` | async RL 主启动脚本。统一管理 `fully_async_main`、tool/reward server、fresh-run 目录、`max_concurrent_samples/max_queue_size`、Blackwell 相关覆盖 |
+| `run_async_probe_8gpu_blackwell.sh` | 8 卡 `RTX PRO 6000 Blackwell` 的 async probe wrapper。封装 preflight、base/sync_stream/async_partial/followup64k 各阶段 |
 | `run_eval_browsecomp.sh` | BrowseComp 评测（启动服务器 + val_only 模式） |
 | `smoke_test.py` | Gate 2/3 冒烟测试：验证工具服务器 search→open→find 链路 + 奖励服务器 outcome_reward > 0 |
 | `verify_tool_consistency.py` | 验证 SFT parquet 和 RL YAML 经各自真实路径渲染后的 system prompt 完全一致 |
@@ -104,6 +127,9 @@ bash examples/carr_deepsearch/scripts/run_rl.sh \
 |------|------|
 | `progress_2x5090.md` | 2x RTX 5090 环境验证进度报告。含所有 Gate 验证记录、调试问题汇总、正式训练规划（GPU 选择、训练时长、API 用量估算、完整训练命令） |
 | `project_retrospective_20260312.md` | 本轮 RL 训练前复盘长文。系统解释为什么大多数配置失败、为什么成本失控、为什么 `b4/n4, TP1` 是当前唯一稳定口径，以及下一轮最该先修什么 |
+| `async_rl_explainer_20260321.md` | fully-async policy 的结构化说明。适合新 agent 快速理解 async rollouter/trainer/param sync/partial rollout 语义 |
+| `async_probe_8gpu_blackwell_runbook_20260322.md` | 8 卡 Blackwell 远端执行 runbook。记录 preflight、backend fallback、各 phase probe 口径 |
+| `agent_handoff_background_20260321.md` | 当前交接背景总文档。已补充 async 改造背景、Phase 2p 结论、正式 async short run 的推荐口径 |
 
 ### 根目录项目文档
 
@@ -133,6 +159,18 @@ bash examples/carr_deepsearch/scripts/run_rl.sh \
 | `verl/trainer/ppo/core_algos.py` | 核心算法函数。`@register_adv_est` 注册优势估计器（gae, grpo, reinforce_plus_plus, cgrpo 等）。compute_grpo_outcome_advantage(), compute_policy_loss(), agg_loss() |
 | `verl/trainer/ppo/metric_utils.py` | 指标计算：data_metrics, throughput_metrics, timing_metrics, validation_metrics |
 
+### Async RL（`verl/experimental/fully_async_policy/`）
+
+| 文件 | 说明 |
+|------|------|
+| `verl/experimental/fully_async_policy/fully_async_main.py` | fully-async 入口。创建 MessageQueue、Rollouter、Trainer、ParameterSynchronizer 并驱动训练 |
+| `verl/experimental/fully_async_policy/fully_async_rollouter.py` | async 样本生产者。管理 `pending_queue/cancel_queue/message_queue`、pause/resume、partial rollout、DONE drain 语义 |
+| `verl/experimental/fully_async_policy/fully_async_trainer.py` | async 队列消费者。按 `require_batches` 聚样本、执行 PPO step、触发 param sync，并上报 `fully_async/*` 指标 |
+| `verl/experimental/fully_async_policy/param_sync.py` | trainer→rollout 参数同步调度。当前已修成真实 sync，并处理 sglang/vllm 分支与 fingerprint 校验 |
+| `verl/experimental/fully_async_policy/base_detach_sync.py` | detach sync helper。负责 rollout 权重同步与 post-sync cache flush 校验 |
+| `verl/experimental/fully_async_policy/detach_utils.py` | async agent loop 选择逻辑。支持从配置读取 `fully_async_agent_loop_name`，让 CaRR 指向 `carr_async_partial_tool_agent` |
+| `verl/experimental/fully_async_policy/agent_loop/agent_loop.py` | async batch assembly。处理 `is_cancel/param_version_start/param_version_end` 等字段并组装回 trainer batch |
+
 ### Agent Loop（多轮 agentic RL）
 
 | 文件 | 说明 |
@@ -160,8 +198,9 @@ bash examples/carr_deepsearch/scripts/run_rl.sh \
 
 | 文件 | 说明 |
 |------|------|
-| `verl/workers/rollout/sglang_rollout/sglang_rollout.py` | SGLang ServerAdapter (BaseRollout 子类)。管理 weight sync, KV cache, 模型初始化。传递 attention_backend 到 AsyncHttpServerAdapter（SM120 兼容修改） |
+| `verl/workers/rollout/sglang_rollout/sglang_rollout.py` | SGLang ServerAdapter (BaseRollout 子类)。管理 weight sync、KV cache、模型初始化。当前 async 路径使用 no-flush 权重更新，再配合 pause 阶段 `clear_kv_cache()` |
 | `verl/workers/rollout/sglang_rollout/http_server_engine.py` | AsyncHttpServerAdapter：与 SGLang 推理服务器的 HTTP 通信 |
+| `verl/workers/rollout/sglang_rollout/utils.py` | SGLang 权重同步 helper。包含 `update_sglang_weights_no_flush()` 和 flush 结果硬校验逻辑 |
 
 ### Reward 管理
 

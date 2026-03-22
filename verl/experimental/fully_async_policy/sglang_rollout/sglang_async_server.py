@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import logging
+import os
 from typing import Any, Optional
 
 import ray
@@ -28,6 +29,7 @@ from verl.workers.rollout.sglang_rollout.async_sglang_server import (
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+ASYNC_DEBUG_PARTIAL = os.getenv("VERL_ASYNC_DEBUG_PARTIAL", "0") == "1"
 
 
 class SGLangHttpServerForPartial(SGLangHttpServer):
@@ -141,6 +143,8 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
             if output is None:
                 self.cancel_event.pop(request_id, None)
                 self.req_output.pop(request_id, None)
+                if ASYNC_DEBUG_PARTIAL:
+                    print(f"[SGLangHttpServerForPartial][DebugPartial] request_id={request_id} output=None is_cancel=True")
                 return [], [], True
             meta_info = output.get("meta_info", {})
             output_token_logprobs = meta_info.get("output_token_logprobs")
@@ -158,6 +162,15 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
             is_cancel = generation_handle not in done
             self.cancel_event.pop(request_id, None)
             self.req_output.pop(request_id, None)
+
+        if ASYNC_DEBUG_PARTIAL:
+            print(
+                "[SGLangHttpServerForPartial][DebugPartial] "
+                f"request_id={request_id} "
+                f"is_cancel={is_cancel} "
+                f"token_count={len(token_ids)} "
+                f"paused={self.paused}"
+            )
 
         return token_ids, log_probs, is_cancel
 

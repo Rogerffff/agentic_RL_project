@@ -26,6 +26,10 @@ from ray.util.collective import collective
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_torch_device, is_npu_available
 from verl.utils.distributed import stateless_init_process_group
+from verl.workers.rollout.sglang_rollout.utils import (
+    ensure_sglang_flush_cache_succeeded,
+    update_sglang_weights_no_flush,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -258,8 +262,16 @@ class BaseDetachNcclSync:
         )
         self._finalize_sync_fingerprint(fingerprint_state)
 
-        # Resume kv_cache after weights sync to restore GPU memory released during pause
         if self._is_rollout and self.rollout_device_mesh["infer_tp"].get_local_rank() == 0:
+            flush_response = self._run_async_safely(inference_model.flush_cache())
+            ensure_sglang_flush_cache_succeeded(flush_response, "post-sync validation")
+
+        # Resume kv_cache only when the rollout engine actually frees cache memory.
+        if (
+            self._is_rollout
+            and self.rollout_device_mesh["infer_tp"].get_local_rank() == 0
+            and getattr(self.config.rollout, "free_cache_engine", False)
+        ):
             self._run_async_safely(inference_model.resume_memory_occupation(tags=["kv_cache"]))
 
     def _sync_vllm_weights(self, inference_model, params, sync_group_name):
@@ -284,14 +296,9 @@ class BaseDetachNcclSync:
         self._finalize_sync_fingerprint(fingerprint_state)
 
     async def update_weights(self, inference_engine, params):
-        from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
-
-        await sgl_update_weights(
+        await update_sglang_weights_no_flush(
             engine=inference_engine,
             params_batch=params,
             device_mesh_key="infer_tp",
             device_mesh=self.rollout_device_mesh,
         )
-
-        if self.rollout_device_mesh["infer_tp"].get_local_rank() == 0:
-            await inference_engine.flush_cache()

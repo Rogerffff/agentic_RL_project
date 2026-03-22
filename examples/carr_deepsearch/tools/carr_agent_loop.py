@@ -55,6 +55,7 @@ from verl.utils.rollout_trace import rollout_trace_op
 from .carr_session_manager import CaRRSessionManager
 
 logger = logging.getLogger(__name__)
+ASYNC_DEBUG_PARTIAL = os.getenv("VERL_ASYNC_DEBUG_PARTIAL", "0") == "1"
 
 
 @register("carr_tool_agent")
@@ -813,9 +814,26 @@ class CaRRAsyncPartialToolAgentLoop(CaRRToolAgentLoop):
                 "param_version_end": param_version,
             }
         )
+        if ASYNC_DEBUG_PARTIAL:
+            print(
+                "[CaRRAsyncAgentLoop][DebugPartial] "
+                f"request_id={agent_data.request_id} "
+                f"is_cancel=False "
+                f"param_version_start={output.extra_fields.get('param_version_start')} "
+                f"param_version_end={output.extra_fields.get('param_version_end')} "
+                f"response_tokens={len(output.response_mask)}"
+            )
         return output
 
     def _build_cancelled_output(self, agent_data: AgentData, state: AgentState) -> AgentLoopOutput:
+        if ASYNC_DEBUG_PARTIAL:
+            print(
+                "[CaRRAsyncAgentLoop][DebugPartial] "
+                f"request_id={agent_data.request_id} "
+                f"is_cancel=True "
+                f"state={state.name} "
+                f"response_tokens={len(agent_data.response_mask)}"
+            )
         return AgentLoopOutput(
             prompt_ids=[],
             response_ids=[],

@@ -4,10 +4,35 @@ set -euxo pipefail
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 cd "$PROJECT_DIR"
 
+if [ -f "$HOME/.env" ]; then
+  set -a
+  . "$HOME/.env"
+  set +a
+fi
+
 ASYNC_CONFIG_NAME="${ASYNC_CONFIG_NAME:-carr_grpo_async}"
 ASYNC_PROFILE="${ASYNC_PROFILE:-sync_stream}"
 TRAIN_GPUS="${TRAIN_GPUS:-4}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
+PHASE_NAME="${PHASE_NAME:-async-${ASYNC_PROFILE}-$(date +%Y%m%d_%H%M%S)}"
+TRAINER_RESUME_MODE="${TRAINER_RESUME_MODE:-disable}"
+TRAINER_VAL_BEFORE_TRAIN="${TRAINER_VAL_BEFORE_TRAIN:-false}"
+TRAINER_DEFAULT_LOCAL_DIR="${TRAINER_DEFAULT_LOCAL_DIR:-$HOME/checkpoints/$PHASE_NAME}"
+TRAINER_VALIDATION_DATA_DIR="${TRAINER_VALIDATION_DATA_DIR:-$HOME/eval_results/$PHASE_NAME}"
+TRAINER_EXPERIMENT_NAME="${TRAINER_EXPERIMENT_NAME:-$PHASE_NAME}"
+RAY_NUM_CPUS="${RAY_NUM_CPUS:-32}"
+ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-1}"
+ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-true}"
+ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.3}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
+ROLLOUT_TOTAL_STEPS="${ROLLOUT_TOTAL_STEPS:-}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-}"
+PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-}"
+ASYNC_MAX_CONCURRENT_SAMPLES="${ASYNC_MAX_CONCURRENT_SAMPLES:-}"
+ASYNC_MAX_QUEUE_SIZE="${ASYNC_MAX_QUEUE_SIZE:-}"
+MAX_ASSISTANT_TURNS="${MAX_ASSISTANT_TURNS:-}"
+MAX_TOOL_RESPONSE_LENGTH="${MAX_TOOL_RESPONSE_LENGTH:-}"
+ULIMIT_NOFILE="${ULIMIT_NOFILE:-65535}"
 
 case "${TRAIN_GPUS}:${ROLLOUT_GPUS}" in
   4:4|2:6)
@@ -56,6 +81,13 @@ export VERL_USE_EXTERNAL_MODULES=examples.carr_deepsearch.tools.carr_agent_loop,
 export RAY_enable_open_telemetry=0
 export RAY_ENABLE_OPEN_TELEMETRY=0
 
+ulimit -n "$ULIMIT_NOFILE" || true
+mkdir -p "$TRAINER_DEFAULT_LOCAL_DIR" "$TRAINER_VALIDATION_DATA_DIR"
+
+if [ -n "${MODEL_PATH:-}" ] && [ -z "${SFT_MODEL_PATH:-}" ]; then
+  export SFT_MODEL_PATH="$MODEL_PATH"
+fi
+
 if [ -z "${SFT_MODEL_PATH:-}" ]; then
   SFT_CKPT_ROOT="$HOME/checkpoints/carr_deepsearch_sft"
   LATEST_STEP=$(cat "$SFT_CKPT_ROOT/latest_checkpointed_iteration.txt")
@@ -71,6 +103,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
+clear_stale_listener() {
+  local port="$1"
+
+  if ! command -v lsof >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local pids
+  pids="$(lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  if [ -n "$pids" ]; then
+    echo "Clearing stale listener on port $port: $pids" >&2
+    kill $pids 2>/dev/null || true
+    sleep 1
+  fi
+}
+
 if [ "$ASYNC_CONFIG_NAME" != "carr_grpo_async_base" ]; then
   if [ -z "${SERPER_API_KEY:-}" ] && [ -z "${SERPAPI_API_KEY:-}" ]; then
     echo "ERROR: Must set SERPER_API_KEY or SERPAPI_API_KEY" >&2
@@ -81,6 +129,9 @@ if [ "$ASYNC_CONFIG_NAME" != "carr_grpo_async_base" ]; then
 
   export CARR_REWARD_SERVER_URL="${CARR_REWARD_SERVER_URL:-http://localhost:8888}"
   export CARR_REWARD_TIMEOUT="${CARR_REWARD_TIMEOUT:-650}"
+
+  clear_stale_listener 7230
+  clear_stale_listener 8888
 
   if [ -n "${SERPER_API_KEY:-}" ]; then
     SEARCH_ARGS=(--search_backend serper --serper_api_key "$SERPER_API_KEY")
@@ -153,10 +204,27 @@ CMD=(
   async_training.require_batches="$ASYNC_REQUIRE_BATCHES"
   trainer.n_gpus_per_node="$TRAIN_GPUS"
   rollout.n_gpus_per_node="$ROLLOUT_GPUS"
+  trainer.resume_mode="$TRAINER_RESUME_MODE"
+  trainer.val_before_train="$TRAINER_VAL_BEFORE_TRAIN"
+  trainer.default_local_dir="$TRAINER_DEFAULT_LOCAL_DIR"
+  trainer.validation_data_dir="$TRAINER_VALIDATION_DATA_DIR"
+  trainer.experiment_name="$TRAINER_EXPERIMENT_NAME"
   trainer.save_freq=0
   trainer.test_freq=0
   rollout.test_freq=0
+  ray_kwargs.ray_init.num_cpus="$RAY_NUM_CPUS"
+  actor_rollout_ref.rollout.tensor_model_parallel_size="$ROLLOUT_TP_SIZE"
+  actor_rollout_ref.rollout.enforce_eager="$ROLLOUT_ENFORCE_EAGER"
+  actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_MEMORY_UTILIZATION"
 )
+
+if [ -n "$ASYNC_MAX_CONCURRENT_SAMPLES" ]; then
+  CMD+=(async_training.max_concurrent_samples="$ASYNC_MAX_CONCURRENT_SAMPLES")
+fi
+
+if [ -n "$ASYNC_MAX_QUEUE_SIZE" ]; then
+  CMD+=(async_training.max_queue_size="$ASYNC_MAX_QUEUE_SIZE")
+fi
 
 if [ "$ASYNC_CONFIG_NAME" = "carr_grpo_async_base" ]; then
   CMD+=(
@@ -171,6 +239,30 @@ fi
 
 if [ "${TRAIN_GPUS}:${ROLLOUT_GPUS}" = "3:5" ]; then
   CMD+=(actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1)
+fi
+
+if [ -n "$ROLLOUT_TOTAL_STEPS" ]; then
+  CMD+=(rollout.total_rollout_steps="$ROLLOUT_TOTAL_STEPS")
+fi
+
+if [ -n "$MAX_RESPONSE_LENGTH" ]; then
+  CMD+=(data.max_response_length="$MAX_RESPONSE_LENGTH")
+fi
+
+if [ -n "$PPO_MAX_TOKEN_LEN_PER_GPU" ]; then
+  CMD+=(actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$PPO_MAX_TOKEN_LEN_PER_GPU")
+fi
+
+if [ -n "$MAX_ASSISTANT_TURNS" ] && [ "$ASYNC_CONFIG_NAME" != "carr_grpo_async_base" ]; then
+  CMD+=(actor_rollout_ref.rollout.multi_turn.max_assistant_turns="$MAX_ASSISTANT_TURNS")
+fi
+
+if [ -n "$MAX_TOOL_RESPONSE_LENGTH" ] && [ "$ASYNC_CONFIG_NAME" != "carr_grpo_async_base" ]; then
+  CMD+=(actor_rollout_ref.rollout.multi_turn.max_tool_response_length="$MAX_TOOL_RESPONSE_LENGTH")
+fi
+
+if [ -n "$ATTENTION_BACKEND" ] && [ "$ATTENTION_BACKEND" != "auto" ]; then
+  CMD+=(+actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend="$ATTENTION_BACKEND")
 fi
 
 "${CMD[@]}" "$@"

@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+import time
 
 import torch
 from torch import nn
@@ -44,6 +45,14 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+DEBUG_ASYNC_TRAINER_RUNTIME = os.getenv("VERL_ASYNC_DEBUG_TRAINER", "0") == "1"
+
+
+def _actor_debug_runtime(message: str):
+    if not DEBUG_ASYNC_TRAINER_RUNTIME:
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    print(f"[DPActor][DebugRuntime] rank={rank} {message}", flush=True)
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -390,28 +399,38 @@ class DataParallelPPOActor(BasePPOActor):
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
+        step_start = time.perf_counter()
+        _actor_debug_runtime("enter _optimizer_step")
         if self.scaler is not None:
             self.scaler.unscale_(self.actor_optimizer)
         if isinstance(self.actor_module, FSDP):
+            _actor_debug_runtime("before clip_grad_norm fsdp")
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         elif isinstance(self.actor_module, FSDPModule):
+            _actor_debug_runtime("before clip_grad_norm fsdp2")
             grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
         else:
+            _actor_debug_runtime("before clip_grad_norm torch")
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+        _actor_debug_runtime("after clip_grad_norm")
 
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
 
         # if grad_norm is not finite, skip the update
         if self.scaler is not None:
+            _actor_debug_runtime("before scaler.step")
             self.scaler.step(self.actor_optimizer)
             self.scaler.update()
+            _actor_debug_runtime("after scaler.step")
         else:
             if not torch.isfinite(grad_norm):
                 print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
                 self.actor_optimizer.zero_grad()
             else:
+                _actor_debug_runtime("before optimizer.step")
                 self.actor_optimizer.step()
+                _actor_debug_runtime("after optimizer.step")
 
         # Clear cached weight scales for QAT (weights changed)
         if getattr(self.actor_module, "_qat_fuse_enabled", False):
@@ -419,6 +438,7 @@ class DataParallelPPOActor(BasePPOActor):
 
             invalidate_all_scales(self.actor_module)
 
+        _actor_debug_runtime(f"exit _optimizer_step cost={time.perf_counter() - step_start:.2f}s")
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -542,10 +562,20 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.append("uid")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+        total_response_tokens = None
+        if "response_mask" in data.batch:
+            total_response_tokens = int(data.batch["response_mask"].sum().item())
+        batch_size = int(data.batch["responses"].shape[0]) if "responses" in data.batch else -1
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
+        _actor_debug_runtime(
+            "enter update_policy "
+            f"batch_size={batch_size} total_response_tokens={total_response_tokens} "
+            f"mini_batches={len(mini_batches)} ppo_epochs={self.config.ppo_epochs} "
+            f"use_dynamic_bsz={self.config.use_dynamic_bsz}"
+        )
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
@@ -553,7 +583,7 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/pg_loss": 0.0,
             "actor/kl_loss": 0.0,
         }
-        for _ in range(self.config.ppo_epochs):
+        for epoch_idx in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
@@ -563,16 +593,28 @@ class DataParallelPPOActor(BasePPOActor):
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                mini_batch_response_tokens = None
+                if "response_mask" in mini_batch.batch:
+                    mini_batch_response_tokens = int(mini_batch.batch["response_mask"].sum().item())
+                _actor_debug_runtime(
+                    f"epoch={epoch_idx} mini_batch={batch_idx} "
+                    f"micro_batches={len(micro_batches)} mini_batch_response_tokens={mini_batch_response_tokens}"
+                )
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                for micro_batch_idx, micro_batch in enumerate(micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
+                    micro_response_tokens = int(response_mask.sum().item())
+                    _actor_debug_runtime(
+                        f"epoch={epoch_idx} mini_batch={batch_idx} micro_batch={micro_batch_idx} "
+                        f"enter micro_batch response_tokens={micro_response_tokens}"
+                    )
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
@@ -585,8 +627,16 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = 1 / self.gradient_accumulation
 
                     # all return: (bsz, response_length)
+                    stage_start = time.perf_counter()
+                    _actor_debug_runtime(
+                        f"epoch={epoch_idx} mini_batch={batch_idx} micro_batch={micro_batch_idx} before forward"
+                    )
                     outputs = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    )
+                    _actor_debug_runtime(
+                        f"epoch={epoch_idx} mini_batch={batch_idx} micro_batch={micro_batch_idx} "
+                        f"after forward cost={time.perf_counter() - stage_start:.2f}s"
                     )
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
@@ -661,16 +711,30 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
+                    stage_start = time.perf_counter()
+                    _actor_debug_runtime(
+                        f"epoch={epoch_idx} mini_batch={batch_idx} micro_batch={micro_batch_idx} before backward"
+                    )
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    _actor_debug_runtime(
+                        f"epoch={epoch_idx} mini_batch={batch_idx} micro_batch={micro_batch_idx} "
+                        f"after backward cost={time.perf_counter() - stage_start:.2f}s"
+                    )
 
                     metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
+                _actor_debug_runtime(f"epoch={epoch_idx} mini_batch={batch_idx} before optimizer_step")
                 grad_norm = self._optimizer_step()
+                _actor_debug_runtime(
+                    f"epoch={epoch_idx} mini_batch={batch_idx} "
+                    f"after optimizer_step grad_norm={grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm}"
+                )
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        _actor_debug_runtime("exit update_policy")
         return metrics
