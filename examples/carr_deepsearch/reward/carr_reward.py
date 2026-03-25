@@ -62,11 +62,37 @@ async def compute_score(data_source, solution_str, ground_truth, extra_info=None
     """
     extra_info = extra_info or {}
 
-    messages = extra_info.get("messages", [])
+    raw_messages = extra_info.get("messages", []) or []
+    messages = raw_messages
     rubrics = extra_info.get("rubrics", [])
     search_forbidden_strs = extra_info.get("search_forbidden_strs", [])
     rubric_reward_ratio = extra_info.get("rubric_reward_ratio", 0.3)
-    task_unfinished = extra_info.get("task_unfinished", False)
+    hit_limit = bool(extra_info.get("hit_limit", False))
+    hit_budget = bool(extra_info.get("hit_budget", False))
+    termination_reason = extra_info.get("termination_reason")
+    content_early_stopped = bool(extra_info.get("content_early_stopped", False))
+    empty_history = len(raw_messages) == 0
+    no_final_assistant = bool((not empty_history) and raw_messages[-1].get("role") != "assistant")
+    task_unfinished = bool(hit_limit or hit_budget or empty_history or no_final_assistant)
+    unfinished_limit = bool(hit_limit)
+    unfinished_budget = bool(hit_budget)
+    unfinished_empty_history = bool(task_unfinished and not hit_limit and not hit_budget and empty_history)
+    unfinished_no_final_assistant = bool(task_unfinished and not hit_limit and not hit_budget and no_final_assistant)
+    unfinished_fallback = bool(unfinished_empty_history or unfinished_no_final_assistant)
+    completion_finished_early_stop = bool((not task_unfinished) and content_early_stopped)
+    completion_finished_natural = bool((not task_unfinished) and (not content_early_stopped))
+    known_limit_reasons = {"response_limit", "assistant_turn_limit", "user_turn_limit"}
+    known_budget_reasons = {
+        "rollout_timeout",
+        "real_rollout_timeout",
+        "max_param_span",
+        "tool_call_budget",
+        "search_budget",
+        "open_budget",
+        "find_budget",
+    }
+    termination_unknown_limit = bool(hit_limit and termination_reason not in known_limit_reasons)
+    termination_unknown_budget = bool(hit_budget and termination_reason not in known_budget_reasons)
 
     # Fallback: build minimal history if messages is empty (e.g. single-turn eval)
     if not messages:
@@ -75,21 +101,24 @@ async def compute_score(data_source, solution_str, ground_truth, extra_info=None
             {"role": "assistant", "content": solution_str},
         ]
 
-    # Force task_unfinished if last message is not from assistant
-    if messages and messages[-1].get("role") != "assistant":
-        task_unfinished = True
-
     # Pass-through metrics (constructed AFTER task_unfinished override so values are consistent)
     _pass = {
         "task_unfinished": float(task_unfinished),
+        "unfinished_limit": float(unfinished_limit),
+        "unfinished_budget": float(unfinished_budget),
+        "unfinished_empty_history": float(unfinished_empty_history),
+        "unfinished_no_final_assistant": float(unfinished_no_final_assistant),
+        "unfinished_fallback": float(unfinished_fallback),
+        "completion_finished_early_stop": float(completion_finished_early_stop),
+        "completion_finished_natural": float(completion_finished_natural),
         "tool_call_counts": float(extra_info.get("tool_call_counts", 0)),
         "search_count": float(extra_info.get("search_count", 0)),
         "open_count": float(extra_info.get("open_count", 0)),
         "find_count": float(extra_info.get("find_count", 0)),
-        "hit_limit": float(extra_info.get("hit_limit", False)),
-        "hit_budget": float(extra_info.get("hit_budget", False)),
+        "hit_limit": float(hit_limit),
+        "hit_budget": float(hit_budget),
         "parse_error_count": float(extra_info.get("parse_error_count", 0)),
-        "termination_reason": extra_info.get("termination_reason"),
+        "termination_reason": termination_reason,
         "termination_response_limit": float(extra_info.get("termination_response_limit", 0)),
         "termination_assistant_turn_limit": float(extra_info.get("termination_assistant_turn_limit", 0)),
         "termination_user_turn_limit": float(extra_info.get("termination_user_turn_limit", 0)),
@@ -100,7 +129,9 @@ async def compute_score(data_source, solution_str, ground_truth, extra_info=None
         "termination_find_budget": float(extra_info.get("termination_find_budget", 0)),
         "termination_real_rollout_timeout": float(extra_info.get("termination_real_rollout_timeout", 0)),
         "termination_max_param_span": float(extra_info.get("termination_max_param_span", 0)),
-        "content_early_stopped": float(extra_info.get("content_early_stopped", False)),
+        "termination_unknown_limit": float(termination_unknown_limit),
+        "termination_unknown_budget": float(termination_unknown_budget),
+        "content_early_stopped": float(content_early_stopped),
         "rollout_elapsed_s": float(extra_info.get("rollout_elapsed_s", 0)),
         "active_rollout_elapsed_s": float(extra_info.get("active_rollout_elapsed_s", extra_info.get("rollout_elapsed_s", 0))),
         "real_rollout_elapsed_s": float(extra_info.get("real_rollout_elapsed_s", 0)),

@@ -136,6 +136,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Config
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
         self.enable_partial_rollout = bool(config.async_training.get("partial_rollout", False))
+        self._queue_full_cancel_pending = False
         self.max_concurrent_samples_override = config.async_training.get("max_concurrent_samples", None)
         self.max_queue_size_override = config.async_training.get("max_queue_size", None)
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
@@ -571,27 +572,63 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         while True:
             pause_reason = await self._get_pause_reason()
             if self.paused or pause_reason is not None:
-                print(
-                    "[FullyAsyncRollouter][Processor] "
-                    f"Received pause signal (reason={pause_reason or 'external'}), "
-                    "waiting for remaining tasks to return..."
-                )
                 async with self.lock:
                     self.paused = True
-                while self.active_tasks:
-                    async with self.lock:
-                        # After acquiring the lock, the number of active_tasks may change, need to be verified again
-                        if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
-                        for task in done_tasks:
-                            await task
+
+                if pause_reason == "queue_full" and self.config.async_training.partial_rollout:
+                    print(
+                        "[FullyAsyncRollouter][Processor] "
+                        "Received pause signal (reason=queue_full), "
+                        "canceling unfinished tasks for partial backpressure..."
+                    )
+                    await self.async_rollout_manager.cancel()
+                    if self.active_tasks:
+                        await asyncio.gather(*self.active_tasks, return_exceptions=True)
+                        self.active_tasks.clear()
+                        print(
+                            "[FullyAsyncRollouter][Processor] "
+                            "queue_full partial drain completed after cancellation"
+                        )
+                    else:
+                        self._debug_partial("queue_full pause observed no active tasks to cancel")
+                    # Mark that cancellation_event needs clearing when processor
+                    # actually resumes.  We must NOT call resume() here because
+                    # an external param-sync pause() may have set the same
+                    # cancellation_event concurrently, and clearing it now would
+                    # break the param-sync pause contract.
+                    self._queue_full_cancel_pending = True
+                else:
+                    print(
+                        "[FullyAsyncRollouter][Processor] "
+                        f"Received pause signal (reason={pause_reason or 'external'}), "
+                        "waiting for remaining tasks to return..."
+                    )
+                    while self.active_tasks:
+                        async with self.lock:
+                            # After acquiring the lock, the number of active_tasks may change, need to be verified again
+                            if self.active_tasks:
+                                done_tasks, self.active_tasks = await asyncio.wait(
+                                    self.active_tasks, return_when=asyncio.FIRST_COMPLETED
+                                )
+                            for task in done_tasks:
+                                await task
 
                 async with self.lock:
                     while self.paused:
                         self.idle_start_time = time.time()
                         await self.condition.wait()
+                    # If we performed a queue_full cancel-based drain earlier,
+                    # clear the cancellation_event now that we are truly resuming.
+                    # This is safe because:
+                    # - Public pause()/resume() always calls resume_agent_loops()
+                    #   which clears the event on its own path.
+                    # - We only reach here after paused=False, meaning either
+                    #   monitor_loop released us (queue drained) or public resume()
+                    #   already ran.  In both cases the param-sync cancel contract
+                    #   is no longer active, so clearing is safe.
+                    if getattr(self, "_queue_full_cancel_pending", False):
+                        await self.async_rollout_manager.resume()
+                        self._queue_full_cancel_pending = False
                 continue
 
             if self.feed_done and self.cancel_queue.empty() and self.pending_queue.empty():
@@ -820,12 +857,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def _get_pause_reason(self) -> str | None:
         """Determine whether the build should be paused."""
-        if self.enable_partial_rollout and not self.cancel_queue.empty():
-            self._debug_partial(
-                f"allow resume dispatch because cancel_queue={self.cancel_queue.qsize()} is waiting"
-            )
-            return None
-
         queue_stats = self.message_queue_client.get_statistics_sync()
         queue_size = queue_stats["queue_size"]
 
@@ -836,6 +867,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     f"due to full queue: size={queue_size}, max={self.max_queue_size}"
                 )
             return "queue_full"
+
+        if self.enable_partial_rollout and not self.cancel_queue.empty():
+            self._debug_partial(
+                f"allow resume dispatch because cancel_queue={self.cancel_queue.qsize()} is waiting"
+            )
+            return None
 
         if self.staleness_samples >= self.max_required_samples:
             if self.enable_partial_rollout:

@@ -122,6 +122,54 @@ class CaRRToolAgentLoop(ToolAgentLoop):
 
         return None
 
+    def _build_unfinished_reason_flags(
+        self,
+        *,
+        hit_limit: bool,
+        hit_budget: bool,
+        termination_reason: str | None,
+        reward_history: list[dict[str, Any]],
+        content_early_stopped: bool,
+    ) -> dict[str, Any]:
+        empty_history = len(reward_history) == 0
+        no_final_assistant = bool((not empty_history) and reward_history[-1].get("role") != "assistant")
+        task_unfinished = hit_limit or hit_budget or empty_history or no_final_assistant
+
+        unfinished_limit = bool(hit_limit)
+        unfinished_budget = bool(hit_budget)
+        unfinished_empty_history = bool(task_unfinished and not hit_limit and not hit_budget and empty_history)
+        unfinished_no_final_assistant = bool(task_unfinished and not hit_limit and not hit_budget and no_final_assistant)
+        unfinished_fallback = bool(unfinished_empty_history or unfinished_no_final_assistant)
+
+        known_limit_reasons = {"response_limit", "assistant_turn_limit", "user_turn_limit"}
+        known_budget_reasons = {
+            "rollout_timeout",
+            "real_rollout_timeout",
+            "max_param_span",
+            "tool_call_budget",
+            "search_budget",
+            "open_budget",
+            "find_budget",
+        }
+        termination_unknown_limit = bool(hit_limit and termination_reason not in known_limit_reasons)
+        termination_unknown_budget = bool(hit_budget and termination_reason not in known_budget_reasons)
+
+        completion_finished_early_stop = bool((not task_unfinished) and content_early_stopped)
+        completion_finished_natural = bool((not task_unfinished) and (not content_early_stopped))
+
+        return {
+            "task_unfinished": task_unfinished,
+            "unfinished_limit": unfinished_limit,
+            "unfinished_budget": unfinished_budget,
+            "unfinished_empty_history": unfinished_empty_history,
+            "unfinished_no_final_assistant": unfinished_no_final_assistant,
+            "unfinished_fallback": unfinished_fallback,
+            "completion_finished_early_stop": completion_finished_early_stop,
+            "completion_finished_natural": completion_finished_natural,
+            "termination_unknown_limit": 1.0 if termination_unknown_limit else 0.0,
+            "termination_unknown_budget": 1.0 if termination_unknown_budget else 0.0,
+        }
+
     def _extract_completed_answer_text(self, assistant_text: str) -> str | None:
         """Return a safely trimmable final answer prefix, or ``None``.
 
@@ -383,15 +431,12 @@ class CaRRToolAgentLoop(ToolAgentLoop):
             if self.tool_server_url:
                 await self.session_manager.close(request_id, self.tool_server_url)
 
-        # Determine task_unfinished:
-        # 1. Explicitly truncated by limits → always unfinished
-        # 2. Explicitly terminated by rollout/tool budgets → always unfinished
-        # 3. Empty history or last message not assistant → unfinished (fallback)
-        task_unfinished = (
-            hit_limit
-            or hit_budget
-            or len(reward_history) == 0
-            or reward_history[-1].get("role") != "assistant"
+        unfinished_flags = self._build_unfinished_reason_flags(
+            hit_limit=hit_limit,
+            hit_budget=hit_budget,
+            termination_reason=termination_reason,
+            reward_history=reward_history,
+            content_early_stopped=content_early_stopped,
         )
 
         # Build output (same as base class)
@@ -419,7 +464,7 @@ class CaRRToolAgentLoop(ToolAgentLoop):
             "turn_scores": agent_data.turn_scores,
             "tool_rewards": agent_data.tool_rewards,
             "messages": reward_history,
-            "task_unfinished": task_unfinished,
+            **unfinished_flags,
             "tool_call_counts": total_tool_calls,
             "search_count": search_count,
             "open_count": open_count,
@@ -436,6 +481,8 @@ class CaRRToolAgentLoop(ToolAgentLoop):
             "termination_search_budget": 1.0 if termination_reason == "search_budget" else 0.0,
             "termination_open_budget": 1.0 if termination_reason == "open_budget" else 0.0,
             "termination_find_budget": 1.0 if termination_reason == "find_budget" else 0.0,
+            "termination_real_rollout_timeout": 0.0,
+            "termination_max_param_span": 0.0,
             "content_early_stopped": content_early_stopped,
             "rollout_elapsed_s": float(time.monotonic() - rollout_start),
             "response_length": float(len(agent_data.response_mask)),
@@ -769,18 +816,20 @@ class CaRRAsyncPartialToolAgentLoop(CaRRToolAgentLoop):
             extra_fields={},
         )
         reward_history = carr_state.get("reward_history", [])
-        task_unfinished = (
-            carr_state.get("hit_limit", False)
-            or carr_state.get("hit_budget", False)
-            or len(reward_history) == 0
-            or reward_history[-1].get("role") != "assistant"
+        content_early_stopped = bool(carr_state.get("content_early_stopped", False))
+        unfinished_flags = self._build_unfinished_reason_flags(
+            hit_limit=bool(carr_state.get("hit_limit", False)),
+            hit_budget=bool(carr_state.get("hit_budget", False)),
+            termination_reason=termination_reason,
+            reward_history=reward_history,
+            content_early_stopped=content_early_stopped,
         )
         output.extra_fields.update(
             {
                 "turn_scores": agent_data.turn_scores,
                 "tool_rewards": agent_data.tool_rewards,
                 "messages": reward_history,
-                "task_unfinished": task_unfinished,
+                **unfinished_flags,
                 "tool_call_counts": carr_state.get("total_tool_calls", 0),
                 "search_count": carr_state.get("search_count", 0),
                 "open_count": carr_state.get("open_count", 0),
@@ -799,7 +848,7 @@ class CaRRAsyncPartialToolAgentLoop(CaRRToolAgentLoop):
                 "termination_find_budget": 1.0 if termination_reason == "find_budget" else 0.0,
                 "termination_real_rollout_timeout": 1.0 if termination_reason == "real_rollout_timeout" else 0.0,
                 "termination_max_param_span": 1.0 if termination_reason == "max_param_span" else 0.0,
-                "content_early_stopped": carr_state.get("content_early_stopped", False),
+                "content_early_stopped": content_early_stopped,
                 "rollout_elapsed_s": active_elapsed_s,
                 "active_rollout_elapsed_s": active_elapsed_s,
                 "real_rollout_elapsed_s": real_elapsed_s,

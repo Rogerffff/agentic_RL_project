@@ -20,7 +20,11 @@ TRAINER_VAL_BEFORE_TRAIN="${TRAINER_VAL_BEFORE_TRAIN:-false}"
 TRAINER_DEFAULT_LOCAL_DIR="${TRAINER_DEFAULT_LOCAL_DIR:-$HOME/checkpoints/$PHASE_NAME}"
 TRAINER_VALIDATION_DATA_DIR="${TRAINER_VALIDATION_DATA_DIR:-$HOME/eval_results/$PHASE_NAME}"
 TRAINER_EXPERIMENT_NAME="${TRAINER_EXPERIMENT_NAME:-$PHASE_NAME}"
-RAY_NUM_CPUS="${RAY_NUM_CPUS:-32}"
+LOG_DIR="${LOG_DIR:-$HOME/logs}"
+TRAINER_SAVE_FREQ="${TRAINER_SAVE_FREQ:-0}"
+TRAINER_TEST_FREQ="${TRAINER_TEST_FREQ:-0}"
+ROLLOUT_TEST_FREQ="${ROLLOUT_TEST_FREQ:-0}"
+RAY_NUM_CPUS="${RAY_NUM_CPUS:-128}"
 ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-1}"
 ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-true}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.3}"
@@ -83,6 +87,7 @@ export RAY_ENABLE_OPEN_TELEMETRY=0
 
 ulimit -n "$ULIMIT_NOFILE" || true
 mkdir -p "$TRAINER_DEFAULT_LOCAL_DIR" "$TRAINER_VALIDATION_DATA_DIR"
+mkdir -p "$LOG_DIR"
 
 if [ -n "${MODEL_PATH:-}" ] && [ -z "${SFT_MODEL_PATH:-}" ]; then
   export SFT_MODEL_PATH="$MODEL_PATH"
@@ -139,20 +144,23 @@ if [ "$ASYNC_CONFIG_NAME" != "carr_grpo_async_base" ]; then
     SEARCH_ARGS=(--serp_api_key "$SERPAPI_API_KEY")
   fi
 
-  python "$PROJECT_DIR/CaRR/tool_server/launch_server.py" \
+  TOOL_SERVER_LOG="${TOOL_SERVER_LOG:-$LOG_DIR/${PHASE_NAME}.tool.log}"
+  REWARD_SERVER_LOG="${REWARD_SERVER_LOG:-$LOG_DIR/${PHASE_NAME}.reward.log}"
+
+  nohup python "$PROJECT_DIR/CaRR/tool_server/launch_server.py" \
     "${SEARCH_ARGS[@]}" \
     --jina_api_key "$JINA_API_KEY" \
-    --port 7230 &
+    --port 7230 >"$TOOL_SERVER_LOG" 2>&1 < /dev/null &
   PIDS+=($!)
 
-  (
+  nohup bash -lc "
     cd "$PROJECT_DIR/CaRR/deepsearch_rm_with_rubrics"
     python launch_server.py \
       --port 8888 \
       --model_name deepseek-chat \
       --base_url https://api.deepseek.com \
       --api_key "$DEEPSEEK_API_KEY"
-  ) &
+  " >"$REWARD_SERVER_LOG" 2>&1 < /dev/null &
   PIDS+=($!)
 
   tool_ready=0
@@ -209,9 +217,9 @@ CMD=(
   trainer.default_local_dir="$TRAINER_DEFAULT_LOCAL_DIR"
   trainer.validation_data_dir="$TRAINER_VALIDATION_DATA_DIR"
   trainer.experiment_name="$TRAINER_EXPERIMENT_NAME"
-  trainer.save_freq=0
-  trainer.test_freq=0
-  rollout.test_freq=0
+  trainer.save_freq="$TRAINER_SAVE_FREQ"
+  trainer.test_freq="$TRAINER_TEST_FREQ"
+  rollout.test_freq="$ROLLOUT_TEST_FREQ"
   ray_kwargs.ray_init.num_cpus="$RAY_NUM_CPUS"
   actor_rollout_ref.rollout.tensor_model_parallel_size="$ROLLOUT_TP_SIZE"
   actor_rollout_ref.rollout.enforce_eager="$ROLLOUT_ENFORCE_EAGER"

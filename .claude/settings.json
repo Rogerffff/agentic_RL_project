@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 45313 root@147.185.60.9 'curl -sf http://localhost:7230/stats; echo \"\"\"\"; RUN=$\\(ls /root/logs/carr_8gpu_formal/ | sort | tail -1\\); grep -c \"\"HTTP Error 429\"\" /root/logs/carr_8gpu_formal/$RUN/*_tool.log 2>/dev/null || echo 0')",
+      "Bash(python -m ruff check verl/trainer/ppo/ray_trainer.py verl/experimental/agent_loop/agent_loop.py verl/experimental/agent_loop/tool_agent_loop.py verl/experimental/agent_loop/single_turn_agent_loop.py)",
+      "Bash(ruff check:*)",
+      "Bash(ssh -p 10161 root@154.59.156.38 \"grep -c ''pause requested'' /tmp/ray/session_latest/logs/worker-ad44835d706bcf7f36ba9d7b394ad91b0e35b785c2503221c71fd939-01000000-26324.out && echo ''---'' && grep -E ''DebugPartial.*pause requested|DebugPartial.*is_cancel=True|cancel_queue=[1-9]|partial/total_partial_num.*[1-9]'' /tmp/ray/session_latest/logs/worker-ad44835d706bcf7f36ba9d7b394ad91b0e35b785c2503221c71fd939-01000000-26324.out 2>/dev/null && echo ''---TRAINER---'' && tail -5 /root/verl-carr-deepsearch/wandb/run-20260321_162508-1owln6nf/files/output.log 2>/dev/null && echo ''---STATUS---'' && ps aux | grep fully_async_main | grep -v grep | wc -l\")",
+      "Bash(du -h /Users/xiaohui/Desktop/agentic-RL-project/verl-carr-deepsearch/examples/carr_deepsearch/data/*.parquet)",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Read(//Users/xiaohui/Desktop/agentic-RL-project/verl-carr-deepsearch/**)",
+      "Bash(check unfinished'}\\)\"\"\\):*)",
+      "Bash(ssh -p 10161 root@154.59.156.38 -o StrictHostKeyChecking=no -o ConnectTimeout=10 \"echo ''=== time ===''; date; echo ''=== main alive ===''; kill -0 171863 2>/dev/null && echo ''YES'' || echo ''NO''; echo ''=== trainer progress ===''; for f in /tmp/ray/session_latest/logs/worker-*.out; do if grep -q ''FullyAsyncTrainer'' \"\"$f\"\" 2>/dev/null; then grep -E ''step:|global_steps|Loop collection|param_version'' \"\"$f\"\" | tail -10; echo ''---metrics---''; grep -oP ''\\(outcome_reward/mean|task_unfinished/ratio|termination_rollout_timeout/ratio|rollout_elapsed_s/mean|timing_s/step|trainer/idle_ratio|fully_async/partial/total_partial_num|param_sync\\):[0-9.e-]+'' \"\"$f\"\" | tail -20; break; fi; done\")",
+      "Bash(find /Users/xiaohui/Desktop/agentic-RL-project/verl-carr-deepsearch/verl -type f -name *tracking*)",
+      "Bash(find /Users/xiaohui/Desktop/agentic-RL-project/verl-carr-deepsearch -type f -name *Tracking*)",
+      "Bash(grep -r \"experiment_name\\\\|TRAINER_EXPERIMENT_NAME\\\\|wandb\" /Users/xiaohui/Desktop/agentic-RL-project/verl-carr-deepsearch/verl/trainer/config --include=*.yaml)",
+      "Bash(grep -r step: /Users/xiaohui/Desktop/agentic-RL-project/verl-carr-deepsearch/verl --include=*.py)",
+      "Bash(grep -r \"Ray.*log\\\\|/tmp/ray\\\\|session_\" /Users/xiaohui/Desktop/agentic-RL-project/verl-carr-deepsearch/examples/carr_deepsearch/scripts/*.sh)",
+      "Bash(grep -r \"nvidia-smi\\\\|gpu_memory\\\\|cuda\\\\|memory\" /Users/xiaohui/Desktop/agentic-RL-project/verl-carr-deepsearch/verl/experimental/fully_async_policy/*.py)",
+      "Bash(grep -r \"logger\\\\|project_name\\\\|experiment_name\" /Users/xiaohui/Desktop/agentic-RL-project/verl-carr-deepsearch/examples/carr_deepsearch/config/*.yaml)",
+      "Bash(grep -n \"def update_policy\" /Users/xiaohui/Desktop/agentic-RL-project/verl-carr-deepsearch/verl/workers/actor/*.py)",
+      "Bash(find /Users/xiaohui/Desktop/agentic-RL-project/verl-carr-deepsearch/examples/carr_deepsearch/remote_artifacts -name *.jsonl -o -name metrics* -o -name *summary*)",
+      "Bash(git reset:*)"
+    ]
+  }
+}
