@@ -158,7 +158,9 @@
 - `Stage 0 eval` 已完成：SFT / step70 / step90 fixed subset64 sampled eval，async 起点选 `step70`
 - async infra 修复已全部验证通过：真实 param sync、partial cross-version sample、queue_full cancel-based drain、dynbsz dp_group 对齐、互斥 unfinished 指标
 - 偶发的 `SGLang flush_cache failed: empty response` 会导致训练中断，直接 resume 即可恢复
-- 当前最新 checkpoint 请直接查远端 `/root/checkpoints/` 下最新的 `formal_mainline_gs*` 目录
+- async RL 训练已完成 23 个 param_version step（92 global_steps），从 step70 checkpoint 起训
+- 最终 checkpoint：`/root/checkpoints/formal_mainline_gs14_sp2_dynbsz_gmu05_b3_reasonfix_20260323_215746/global_step_23`
+- 如需查看更多 checkpoint，查远端 `/root/checkpoints/` 下最新的 `formal_mainline_gs*` 目录
 - 当前最新可直接用于 model-only restart 的 HF actor 权重：`/root/checkpoints/formal_short_gs5_qfullfix_20260323_002038/global_step_6/actor/huggingface_merged`
 
 当前最重要的工程判断：
@@ -171,7 +173,10 @@
 
 ### 4.3 当前 active mainline
 
-最新 active training 请查远端 `/root/logs/` 下最新的 `formal_mainline_gs*.launcher.log`。
+async RL 训练已于 2026-03-23 完成（`rollout.total_rollout_steps` 耗尽正常结束）。
+最终 run：`formal_mainline_gs14_sp2_dynbsz_gmu05_b3_reasonfix_20260323_215746`
+最终 checkpoint：`global_step_23`（param_version=23, global_step=92）
+如需 resume 或 eval，用此 checkpoint。
 
 主线口径（自 step 9 起稳定不变）：
 
@@ -184,35 +189,53 @@
 - `wall=480 / real_wall=960`
 - `max_concurrent_samples=6` / `trigger_parameter_sync_step=4` / `staleness_threshold=0.5`
 
-### 4.4 async RL 全 step 指标历史（step 1 → 15）
+### 4.4 async RL 全 step 指标历史（step 1 → 23）
 
 每个 step 对应 `trigger_sync_step` 个 global_steps（sync=2 时 2 gs/step，sync=4 时 4 gs/step）。
+训练最终在 step 24 进行中因 `rollout.total_rollout_steps` 耗尽正常结束。最终可用 checkpoint 为 `global_step_23`。
 
-| Step | 配置变更 | 每 gs | outcome | timeout | unfinished | param_sync | 备注 |
-|------|---------|-------|---------|---------|------------|-----------|------|
-| 1 | 4:4 conc=12 n=8 | - | 0.0 | 100% | 100% | - | SGLang 过载，全 timeout |
-| 1' | 4:4 conc=4 n=8 sync=2 | 273s | 0.44 | 53% | 53% | - | 首次有训练信号 |
-| 2 | 同上 | 370s | 0.11 | 69% | 83% | 248s | param_sync 长尾暴露 |
-| 3 | 4:4 conc=4 sync=4 | 315s | 0.11 | 72% | 79% | 2.1s | sync=4 绕过 self-pause |
-| 4 | **2:6 SP=2** wall=480 b=4 | 515s | **0.43** | 31% | 54% | 323s | SP=2 通信慢但信号好 |
-| 5 | 同上 | 406s | 0.21 | 16% | 68% | 63s | pipeline 满 |
-| 6 | + queue_full fix | 408s | 0.16 | 59% | 78% | **1.7s** | qfullfix 验证 |
-| 7 | + **gmu=0.5** | 382s | **0.37** | **0%** | 39% | 47s | gmu 突破！零 timeout |
-| 8 | 同上 | 443s | 0.20 | 0% | 68% | - | 长序列 batch |
-| 9 | + **b=3** | **317s** | **0.39** | **0%** | **31%** | 72s | b=3 加速 + 信号最佳 |
-| 10 | 同上 | 298s | 0.33 | 0% | 59% | 8s | pipeline 满 |
-| 11 | 同上 | 296s | 0.22 | 0% | 66% | - | 磁盘满 OOM → resume |
-| 11' | resume | 335s | 0.35 | 0% | 53% | 38s | 首步效应 |
-| 12 | + **指标修复** | 325s | 0.31 | 0% | 53% | - | 新 unfinished 子原因 |
-| 13 | 同上 | 324s | 0.24 | 0% | 59% | 21s | 稳定 |
-| 14 | 同上 | 283s | **0.39** | 0% | 53% | 209s | search_budget 12.5% |
-| 15 | resume(flush_cache 崩) | 339s | 0.13→0.38 | 0→21% | 65→51% | 102s | 首步冷启动 + 恢复 |
+| Step | 配置变更 | 每 gs | outcome | rubric | timeout | unfinished | param_sync | 备注 |
+|------|---------|-------|---------|--------|---------|------------|-----------|------|
+| 1 | 4:4 conc=12 n=8 | - | 0.0 | 0.0 | 100% | 100% | - | SGLang 过载，全 timeout |
+| 1' | 4:4 conc=4 n=8 sync=2 | 273s | 0.44 | 0.053 | 53% | 53% | - | 首次有训练信号 |
+| 2 | 同上 | 370s | 0.11 | 0.044 | 69% | 83% | 248s | param_sync 长尾暴露 |
+| 3 | 4:4 conc=4 sync=4 | 315s | 0.11 | 0.020 | 72% | 79% | 2.1s | sync=4 绕过 self-pause |
+| 4 | **2:6 SP=2** wall=480 b=4 | 515s | **0.43** | 0.079 | 31% | 54% | 323s | SP=2 通信慢但信号好 |
+| 5 | 同上 | 406s | 0.21 | 0.023 | 16% | 68% | 63s | pipeline 满 |
+| 6 | + queue_full fix | 408s | 0.16 | 0.019 | 59% | 78% | **1.7s** | qfullfix 验证 |
+| 7 | + **gmu=0.5** | 382s | **0.37** | 0.040 | **0%** | 39% | 47s | gmu 突破！零 timeout |
+| 8 | 同上 | 443s | 0.20 | 0.023 | 0% | 68% | - | 长序列 batch |
+| 9 | + **b=3** | **317s** | **0.39** | **0.123** | **0%** | **31%** | 72s | b=3 加速 + 信号最佳 |
+| 10 | 同上 | 298s | 0.33 | 0.043 | 0% | 59% | 8s | pipeline 满 |
+| 11 | 同上 | 296s | 0.22 | 0.028 | 0% | 66% | - | 磁盘满 → resume |
+| 11' | resume | 335s | 0.35 | 0.031 | 0% | 53% | 38s | 首步效应 |
+| 12 | + **指标修复** | 325s | 0.31 | 0.023 | 0% | 53% | - | 新 unfinished 子原因生效 |
+| 13 | 同上 | 324s | 0.24 | 0.025 | 0% | 59% | 21s | 稳定 |
+| 14 | 同上 | 283s | **0.39** | 0.092 | 0% | 53% | 209s | search_budget 12.5% |
+| 15 | resume(flush_cache 崩) | 339s | 0.13 | 0.011 | 21% | 65% | 102s | 首步冷启动 |
+| 16 | 同上（pipeline 满） | **284s** | **0.59** | 0.093 | **0%** | **29%** | **1.7s** | 历史最高 outcome |
+| 17 | 同上 | ~300s | - | - | 0% | - | - | 未单独记录 |
+| 18 | 同上 | 280s | 0.19 | 0.033 | 0% | 58% | 1.8s | 波动 |
+| 19 | 同上 | 277s | 0.34 | 0.057 | 0% | 48% | 1.7s | 回升 |
+| 20 | 同上 | 317s | 0.17 | 0.032 | 8% | 64% | 1.7s | 长序列 batch |
+| 21 | 同上 | 304s | 0.26 | 0.041 | 0% | 62% | - | search_budget 12.5% |
+| 22 | 同上 | 320s | 0.24 | 0.031 | 0% | 57% | - | early_stop 回升到 33% |
+| 23 | 同上 | 319s | 0.15 | 0.028 | 0% | 68% | - | 最终 step，unfinished_limit 54% |
 
 关键趋势：
-- **timeout**：从 100% → 0%（gmu=0.5 后稳定消除）
-- **每 gs 速度**：从 515s → ~300s（比 sync 493s 快 37-43%）
-- **outcome**：在 0.2-0.4 波动（b=3 batch 小，统计噪声大），均值 ~0.3，高于 sync 基线 0.27
+- **timeout**：从 100% → 0%（gmu=0.5 后稳定消除，仅 resume 首步偶发回升）
+- **每 gs 速度**：从 515s → ~280-320s（比 sync 493s 快 35-43%）
+- **outcome**：在 0.15-0.59 之间波动（b=3 batch 小，统计噪声大），移动均值 ~0.29，高于 sync 基线 0.27
+- **rubric**：最高达 0.123（step 9），均值 ~0.04，高于 sync 基线 0.05 的部分 step
 - **主要截断原因**：从 timeout 主导 → response_limit + search_budget 主导（模型学到更长搜索策略）
+- **模型行为演变**：tool_calls 从 ~32 涨到 ~48，response_length 从 ~37k 涨到 ~53k，模型在学习更深度搜索
+- **训练稳定性**：step 9-23（b=3 主线）连续运行，仅因 flush_cache 偶发崩溃和磁盘满各中断一次，resume 后立即恢复
+
+**最终训练状态**：
+- 训练在 step 24 进行中正常结束（`rollout.total_rollout_steps` 耗尽）
+- 最终 checkpoint：`global_step_23`（param_version=23, global_step=92）
+- 总训练 global_steps：92（从 step70 checkpoint 起 async 训练）
+- 总 param sync 次数：23
 
 **如何查看完整 step metrics**：
 
@@ -220,8 +243,8 @@
 
 - 远端日志目录：`/root/logs/`
 - 每轮训练对应一个 `*.launcher.log`
-- 在日志中搜索 `step:N -` 可以找到该 step 的完整输出
-- 具体哪个 step 在哪个日志里，参考 §4.4 的 step-run 映射：
+- 在日志中搜索 `step:N - training` 可以找到该 step 的完整输出
+- 具体哪个 step 在哪个日志里：
   - step 1-3: `gate_b4_n8_64k_conc4_*.launcher.log` 和 `gate_b4_n8_64k_conc4_sync4_resume_*.launcher.log`
   - step 4-5: `validate_b4_n8_64k_2x6_dynbsz_sp2_tok36864_wall480_*.launcher.log`
   - step 6: `formal_short_gs5_qfullfix_*.launcher.log`
@@ -229,32 +252,27 @@
   - step 9-11: `formal_mainline_gs8_sp2_dynbsz_gmu05_b3_*.launcher.log`
   - step 11': `formal_mainline_gs10_sp2_dynbsz_gmu05_b3_*.launcher.log`
   - step 12-14: `formal_mainline_gs11_sp2_dynbsz_gmu05_b3_reasonfix_*.launcher.log`
-  - step 15+: `formal_mainline_gs14_sp2_dynbsz_gmu05_b3_reasonfix_*.launcher.log`
+  - step 15-23: `formal_mainline_gs14_sp2_dynbsz_gmu05_b3_reasonfix_*.launcher.log`
 
 注意：wandb 未正常工作（`/root/wandb/` 为空），所有 metrics 仅在 launcher logs 和 Ray worker logs 中。
 
-step 15 的详细截断分布（新增互斥指标首次完整输出）：
+step 16 详细指标（历史最佳 step）：
 
 ```
-step 15 (resume 后第一步，含冷启动效应):
-  outcome_reward/mean:     0.125   （冷启动偏低，后续恢复）
-  rubric_reward/mean:      0.011
-  task_unfinished/ratio:   0.653
-    unfinished_limit/ratio:  0.361   ← response_limit 主导
-    unfinished_budget/ratio: 0.292   ← rollout_timeout 回升（冷启动）
-    unfinished_fallback:     0.0
-    unfinished_empty_history: 0.0
-    unfinished_no_final_assistant: 0.0
-  completion_finished_early_stop: 0.181
-  completion_finished_natural:    0.167
-  termination_rollout_timeout:    0.208  ← resume 首步冷启动，后续应回到 0%
-  termination_response_limit:     0.083
-  termination_search_budget:      0.0
-  termination_unknown_limit:      0.0    ← 没有未解释的截断
-  termination_unknown_budget:     0.0
-  rollout_elapsed_s/mean:  356s
-  timing_s/step (4gs):     1356s → 每 gs 339s
-  param_sync:              102s
+step 16 (pipeline 满，gmu=0.5 稳定态):
+  outcome_reward/mean:     0.594   ← 历史最高
+  rubric_reward/mean:      0.093
+  task_unfinished/ratio:   0.292   ← 历史最低
+  completion_finished_early_stop: 0.479
+  completion_finished_natural:    0.229
+  unfinished_limit/ratio:  0.146
+  unfinished_budget/ratio: 0.146
+  termination_rollout_timeout:    0.0
+  termination_response_limit:     0.042
+  rollout_elapsed_s/mean:  246s
+  timing_s/step (4gs):     1136s → 每 gs 284s
+  param_sync:              1.7s
+  trainer/idle_ratio:      0.001
 ```
 
 ### 4.5 最近一次失败的 throughput probe
