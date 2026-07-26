@@ -26,7 +26,7 @@
 分支关系已经核对：
 
 - `origin/main` 是 `origin/feature/carr-deepsearch` 的祖先。
-- 对比结果为 `0 25`：远程 `main` 没有功能分支缺失的提交，功能分支比 `main` 多 25 个项目提交。
+- `git rev-list --left-right --count origin/main...origin/feature/carr-deepsearch` 的第一列为 `0`：远程 `main` 没有功能分支缺失的提交；第二列是功能分支独有提交数，会随着后续文档提交继续增加，因此不在本文硬编码。
 - 因此继续 CaRR DeepSearch 时，只需要检出 `feature/carr-deepsearch`，不需要在新 Mac 上同时恢复两个 worktree。
 - CaRR 功能分支的已跟踪代码和文档已经推送；当前工作树中 `CaRR` 子模块的状态提示只来自未跟踪数据和 Python 缓存，不是漏推的源码。
 
