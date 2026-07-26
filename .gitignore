@@ -1,3 +1,8 @@
+# Secrets
+**/.env
+**/api.md
+**/api.key
+
 **/*.pt
 **/checkpoints
 **/wget-log
@@ -131,3 +136,8 @@ outputs
 
 # git worktrees
 .worktrees/
+
+# CaRR DeepSearch large local artifacts (kept out of git)
+examples/carr_deepsearch/CaRR_repo/
+examples/carr_deepsearch/CaRR_log/20260415_gpu_eval/
+examples/carr_deepsearch/eval_results/

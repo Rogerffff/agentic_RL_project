@@ -82,8 +82,10 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
 
     # Setting selected agent, that supports partial
     if config.actor_rollout_ref.rollout.multi_turn.enable:
+        rollout_custom = config.actor_rollout_ref.rollout.get("custom") or {}
+        fully_async_agent_loop_name = rollout_custom.get("fully_async_agent_loop_name", "async_partial_tool_agent")
         full_batch.non_tensor_batch["agent_name"] = np.array(
-            ["async_partial_tool_agent"] * len(full_batch), dtype=object
+            [fully_async_agent_loop_name] * len(full_batch), dtype=object
         )
     else:
         full_batch.non_tensor_batch["agent_name"] = np.array(

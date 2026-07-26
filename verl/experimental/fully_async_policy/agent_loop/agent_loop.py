@@ -40,6 +40,7 @@ from verl.utils.rollout_trace import (
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ASYNC_DEBUG_PARTIAL = os.getenv("VERL_ASYNC_DEBUG_PARTIAL", "0") == "1"
 
 
 class FullyAsyncLLMServerManager(AsyncLLMServerManager):
@@ -106,7 +107,9 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
         sampling_params = dict(
             temperature=config.temperature,
             top_p=config.top_p,
-            repetition_penalty=1.0,
+            repetition_penalty=config.repetition_penalty,
+            presence_penalty=config.presence_penalty,
+            frequency_penalty=config.frequency_penalty,
             logprobs=config.calculate_log_probs,
         )
 
@@ -114,6 +117,12 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
         if batch.meta_info.get("validate", False):
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["temperature"] = config.val_kwargs.temperature
+            sampling_params["repetition_penalty"] = config.val_kwargs.repetition_penalty
+            sampling_params["presence_penalty"] = config.val_kwargs.presence_penalty
+            sampling_params["frequency_penalty"] = config.val_kwargs.frequency_penalty
+        sampling_params_override = batch.meta_info.get("sampling_params_override")
+        if sampling_params_override:
+            sampling_params.update(dict(sampling_params_override))
 
         if "agent_name" not in batch.non_tensor_batch:
             default_agent_loop = config.agent.default_agent_loop
@@ -153,8 +162,8 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
     def _addition_process(self, output: DataProto):
         """collect metirics"""
         metrics = output.meta_info.pop("metrics")  # List[Dict[str, str]]
-        processing_times_list = [item["generate_sequences"] for item in metrics]
-        tool_calls_times_list = [item["tool_calls"] for item in metrics]
+        processing_times_list = [item.get("generate_sequences", 0.0) for item in metrics]
+        tool_calls_times_list = [item.get("tool_calls", 0.0) for item in metrics]
         output.non_tensor_batch["processing_times"] = processing_times_list
         output.non_tensor_batch["tool_calls_times"] = tool_calls_times_list
         return output
@@ -196,6 +205,14 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
                 output: AgentLoopOutput = await agent_loop.run(
                     sampling_params, cancellation_event=self.cancellation_event, **kwargs
                 )
+                if ASYNC_DEBUG_PARTIAL:
+                    print(
+                        "[FullyAsyncAgentLoop][DebugPartial] "
+                        f"sample_index={trajectory['sample_index']} "
+                        f"is_cancel={output.extra_fields.get('is_cancel', False)} "
+                        f"param_version_start={output.extra_fields.get('param_version_start')} "
+                        f"param_version_end={output.extra_fields.get('param_version_end')}"
+                    )
                 if not output.extra_fields.get("is_cancel", False):
                     kwargs.pop("output", None)
                     output = await self._agent_loop_postprocess(output, **kwargs)

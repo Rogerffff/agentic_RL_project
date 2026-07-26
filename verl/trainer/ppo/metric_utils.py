@@ -27,6 +27,18 @@ from verl import DataProto
 from verl.utils.import_utils import deprecated
 
 
+def _is_numeric_metric_value(value: Any) -> bool:
+    """Return True when a validation metric value can be aggregated numerically.
+
+    Validation dumps may contain auxiliary categorical fields such as
+    ``termination_reason``. Those fields can be strings or ``None`` and should not
+    be routed through numeric reducers like ``np.mean``.
+    """
+    if value is None or isinstance(value, (str, bytes)):
+        return False
+    return isinstance(value, (bool, int, float, np.number, np.bool_))
+
+
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     """
@@ -221,6 +233,61 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+
+    # CaRR reward components
+    for key in ["outcome_reward", "rubric_reward"]:
+        if key in batch.non_tensor_batch:
+            vals = batch.non_tensor_batch[key]
+            metrics[f"{key}/min"] = float(np.min(vals))
+            metrics[f"{key}/max"] = float(np.max(vals))
+            metrics[f"{key}/mean"] = float(np.mean(vals))
+
+    # Per-tool-type counts
+    for key in ["search_count", "open_count", "find_count"]:
+        if key in batch.non_tensor_batch:
+            vals = batch.non_tensor_batch[key]
+            metrics[f"{key}/mean"] = float(np.mean(vals))
+
+    # Boolean-like metrics emitted from custom agent loops / reward pass-through.
+    # These are stored as 0/1 floats in non_tensor_batch and should surface as
+    # per-step ratios in W&B, not disappear silently.
+    for key in [
+        "task_unfinished",
+        "unfinished_limit",
+        "unfinished_budget",
+        "unfinished_empty_history",
+        "unfinished_no_final_assistant",
+        "unfinished_fallback",
+        "completion_finished_early_stop",
+        "completion_finished_natural",
+        "hit_limit",
+        "hit_budget",
+        "content_early_stopped",
+        "termination_response_limit",
+        "termination_assistant_turn_limit",
+        "termination_user_turn_limit",
+        "termination_rollout_timeout",
+        "termination_real_rollout_timeout",
+        "termination_max_param_span",
+        "termination_unknown_limit",
+        "termination_unknown_budget",
+        "termination_tool_call_budget",
+        "termination_search_budget",
+        "termination_open_budget",
+        "termination_find_budget",
+    ]:
+        if key in batch.non_tensor_batch:
+            vals = batch.non_tensor_batch[key]
+            metrics[f"{key}/ratio"] = float(np.mean(vals))
+
+    if "parse_error_count" in batch.non_tensor_batch:
+        vals = batch.non_tensor_batch["parse_error_count"]
+        metrics["parse_error_count/mean"] = float(np.mean(vals))
+
+    for key in ["rollout_elapsed_s", "response_length_ratio"]:
+        if key in batch.non_tensor_batch:
+            vals = batch.non_tensor_batch[key]
+            metrics[f"{key}/mean"] = float(np.mean(vals))
 
     return metrics
 
@@ -593,8 +660,11 @@ def process_validation_metrics(
             var_dict = uid_dict.setdefault(uid, {})
 
             for var_name, var_vals in var2vals.items():
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+                # Skip empty, categorical, or partially missing values.
+                # Validation outputs may include string/None fields such as
+                # termination_reason that should be dumped to JSONL but not
+                # aggregated as numeric metrics.
+                if not var_vals or not all(_is_numeric_metric_value(val) for val in var_vals):
                     continue
 
                 # compute mean and std

@@ -21,6 +21,14 @@ async_training:
   # When synchronizing parameters, whether to interrupt rollouter and perform partial rollout
   partial_rollout: True
 
+  # Optional independent cap for the rollout worker's in-flight sample count.
+  # When null, keep the legacy behavior that derives concurrency from max_required_samples.
+  max_concurrent_samples: null
+
+  # Optional independent cap for the message queue backlog.
+  # In partial mode, when null, default to max(max_required_samples, max_concurrent_samples).
+  max_queue_size: null
+
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 

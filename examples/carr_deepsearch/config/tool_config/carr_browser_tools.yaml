@@ -1,0 +1,66 @@
+# CaRR browser tools configuration for deep search agent.
+#
+# Three tools (search, open, find) all use the same CaRRBrowserTool class,
+# differentiated by the tool_schema.function.name field.
+#
+# Note: browser.open.id uses type "string" because verl's OpenAIFunctionPropertySchema
+# does not support oneOf. The CaRRBrowserTool.execute() converts to int when needed.
+#
+# IMPORTANT: tool_schema keys must be in alphabetical order at ALL nesting levels.
+# Parquet (pyarrow) sorts struct field names alphabetically during round-trip.
+# If YAML key order doesn't match, SFT and RL system prompts will differ.
+
+tools:
+  - class_name: "examples.carr_deepsearch.tools.carr_browser_tool.CaRRBrowserTool"
+    config:
+      type: native
+      tool_server_url: "http://localhost:7230"
+    tool_schema:
+      function:
+        description: "Search the web for information"
+        name: "browser.search"
+        parameters:
+          properties:
+            num:
+              description: "Number of results to return"
+              type: "integer"
+            query:
+              description: "Search query"
+              type: "string"
+          required: ["query"]
+          type: "object"
+      type: "function"
+
+  - class_name: "examples.carr_deepsearch.tools.carr_browser_tool.CaRRBrowserTool"
+    config:
+      type: native
+      tool_server_url: "http://localhost:7230"
+    tool_schema:
+      function:
+        description: "Open a webpage by search result ID or URL"
+        name: "browser.open"
+        parameters:
+          properties:
+            id:
+              description: "ID (integer as string) or URL"
+              type: "string"
+          required: ["id"]
+          type: "object"
+      type: "function"
+
+  - class_name: "examples.carr_deepsearch.tools.carr_browser_tool.CaRRBrowserTool"
+    config:
+      type: native
+      tool_server_url: "http://localhost:7230"
+    tool_schema:
+      function:
+        description: "Find a pattern in the currently opened webpage"
+        name: "browser.find"
+        parameters:
+          properties:
+            pattern:
+              description: "Pattern to search for"
+              type: "string"
+          required: ["pattern"]
+          type: "object"
+      type: "function"

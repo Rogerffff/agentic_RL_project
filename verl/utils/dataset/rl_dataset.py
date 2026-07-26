@@ -118,12 +118,14 @@ class RLHFDataset(Dataset):
         self.tool_schemas = None
         if self.tool_config_path:
             try:
+                from verl.tools.schemas import normalize_tool_schema
                 from verl.tools.utils.tool_registry import initialize_tools_from_config
 
                 tool_list = initialize_tools_from_config(self.tool_config_path)
-                # match ToolAgentLoop behaviour: model_dump to plain dicts
+                # match ToolAgentLoop behaviour: model_dump to plain dicts, then normalize
                 self.tool_schemas = [
-                    tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list
+                    normalize_tool_schema(tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True))
+                    for tool in tool_list
                 ]
             except Exception as e:
                 logger.warning("Failed to initialize tools from %s: %s", self.tool_config_path, e)

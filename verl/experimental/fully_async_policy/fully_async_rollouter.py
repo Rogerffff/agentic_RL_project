@@ -14,6 +14,7 @@
 
 import asyncio
 import functools
+import hashlib
 import multiprocessing
 import os
 import time
@@ -63,6 +64,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.processor = processor
         self.config = config
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
+        self.debug_partial_rollout = os.getenv("VERL_ASYNC_DEBUG_PARTIAL", "0") == "1"
 
         assert not self.hybrid_engine
         assert self.config.data.train_batch_size == 0, "train_batch_size must be zero"
@@ -117,7 +119,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         print(f"[FullyAsyncRollouter] Rollouter _create_dataloader...\n{train_dataset}\n{val_dataset}")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
-
         self.total_rollout_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
         if self.config.rollout.total_rollout_steps is not None:
             self.total_rollout_steps = min(self.config.rollout.total_rollout_steps, self.total_rollout_steps)
@@ -134,6 +135,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # Config
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
+        self.enable_partial_rollout = bool(config.async_training.get("partial_rollout", False))
+        self._queue_full_cancel_pending = False
+        self.max_concurrent_samples_override = config.async_training.get("max_concurrent_samples", None)
+        self.max_queue_size_override = config.async_training.get("max_queue_size", None)
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.require_batches = config.async_training.require_batches
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
@@ -154,7 +159,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.version_start_time = None
 
         # Concurrency control
-        # Modified by self.pause() or self._should_pause_generation()
+        # Modified by self.pause() or self._get_pause_reason()
         self.paused = False
         self.running = True
         self.monitor_loop_trigger = True
@@ -166,12 +171,17 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.pending_queue = asyncio.Queue(maxsize=128)
         self.active_tasks = set()
         self.cancel_queue = asyncio.Queue()
+        self.feed_done = False
 
         cpu_cores = multiprocessing.cpu_count()
         # cpu case use cpu_cores; io case use cpu_cores*2
         self.validate_executor = ThreadPoolExecutor(max_workers=cpu_cores)
         self.parallel_validate_and_rollout = config.async_training.get("parallel_validate_and_rollout", False)
         self.validate_task = None
+
+    def _debug_partial(self, message: str):
+        if self.debug_partial_rollout:
+            print(f"[FullyAsyncRollouter][DebugPartial] {message}")
 
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
@@ -200,9 +210,22 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
 
-            self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * 16
-            self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
-            self.max_queue_size = self.max_required_samples
+            default_max_concurrent_samples = min(
+                len(self.async_rollout_manager.server_handles) * 16,
+                self.max_required_samples,
+            )
+            if self.max_concurrent_samples_override is None:
+                self.max_concurrent_samples = default_max_concurrent_samples
+            else:
+                self.max_concurrent_samples = max(1, int(self.max_concurrent_samples_override))
+            if self.enable_partial_rollout:
+                default_max_queue_size = max(self.max_required_samples, self.max_concurrent_samples)
+                if self.max_queue_size_override is None:
+                    self.max_queue_size = default_max_queue_size
+                else:
+                    self.max_queue_size = max(1, int(self.max_queue_size_override))
+            else:
+                self.max_queue_size = self.max_required_samples
 
             print(
                 f"[FullyAsyncRollouter] required_samples : {self.required_samples} "
@@ -230,10 +253,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         async with self.lock:
             old_version = self.current_param_version
             self.current_param_version = version
-            # every time param change, reset staleness_samples
-            self.staleness_samples = (
-                len(self.active_tasks) + self.cancel_queue.qsize() + await self.message_queue_client.get_queue_size()
-            )
+            # In partial mode, resumed samples should not be re-blocked by the staleness gate.
+            # We only count work that is already completed or still actively running.
+            base_staleness_samples = len(self.active_tasks) + await self.message_queue_client.get_queue_size()
+            if not self.enable_partial_rollout:
+                base_staleness_samples += self.cancel_queue.qsize()
+            self.staleness_samples = base_staleness_samples
             timing_raw = {}
             idle_ratio = None
             if self.idle_start_time is not None and self.version_start_time is not None:
@@ -281,6 +306,53 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.validate_task = asyncio.create_task(
                 self.do_validate_async(timing_raw, version, global_steps, use_trainer_do_validate)
             )
+
+    async def probe_rollout_logprobs(
+        self,
+        raw_prompt: list[dict],
+        sampling_params_override: dict | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, object]:
+        if self.async_rollout_manager is None:
+            await self._init_async_rollout_manager()
+
+        sample = DataProto.from_dict(
+            non_tensors={
+                "raw_prompt": np.array([list(raw_prompt)], dtype=object),
+                "agent_name": np.array(
+                    [
+                        agent_name
+                        or (
+                            (self.config.actor_rollout_ref.rollout.get("custom") or {}).get(
+                                "fully_async_agent_loop_name", "async_partial_tool_agent"
+                            )
+                            if self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            else "partial_single_turn_agent"
+                        )
+                    ],
+                    dtype=object,
+                ),
+                "tools_kwargs": np.array([{}], dtype=object),
+                "extra_info": np.array([{}], dtype=object),
+            },
+            meta_info={
+                "validate": False,
+                "global_steps": self.global_steps,
+                "sampling_params_override": sampling_params_override or {},
+            },
+        )
+        output, is_cancel = await self.async_rollout_manager.generate_single_sample_async(sample, [None])
+        if is_cancel:
+            raise RuntimeError("rollout logprob probe was interrupted by a partial cancel")
+
+        response_mask = output.batch["response_mask"][0].to(dtype=torch.bool)
+        rollout_log_probs = output.batch["rollout_log_probs"][0][response_mask].detach().cpu().to(dtype=torch.float32)
+        hasher = hashlib.sha256()
+        hasher.update(rollout_log_probs.numpy().tobytes())
+        return {
+            "digest": hasher.hexdigest(),
+            "num_logprobs": int(rollout_log_probs.numel()),
+        }
 
     def _validate_wrapper(
         self, timing_raw: dict, version: int, global_steps: int = 0, use_trainer_do_validate: bool = False
@@ -498,27 +570,82 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         Streaming worker coroutines, a sample is submitted for processing without waiting for batches
         """
         while True:
-            if self.paused or await self._should_pause_generation():
-                print(
-                    "[FullyAsyncRollouter][Processor] Received pause signal, waiting for remaining tasks to return..."
-                )
+            pause_reason = await self._get_pause_reason()
+            if self.paused or pause_reason is not None:
                 async with self.lock:
                     self.paused = True
-                while self.active_tasks:
+
+                if pause_reason == "queue_full" and self.config.async_training.partial_rollout:
+                    print(
+                        "[FullyAsyncRollouter][Processor] "
+                        "Received pause signal (reason=queue_full), "
+                        "canceling unfinished tasks for partial backpressure..."
+                    )
+                    await self.async_rollout_manager.cancel()
+                    if self.active_tasks:
+                        await asyncio.gather(*self.active_tasks, return_exceptions=True)
+                        self.active_tasks.clear()
+                        print(
+                            "[FullyAsyncRollouter][Processor] "
+                            "queue_full partial drain completed after cancellation"
+                        )
+                    else:
+                        self._debug_partial("queue_full pause observed no active tasks to cancel")
+                    # Mark that cancellation_event needs clearing when processor
+                    # actually resumes.  We must NOT call resume() here because
+                    # an external param-sync pause() may have set the same
+                    # cancellation_event concurrently, and clearing it now would
+                    # break the param-sync pause contract.
+                    self._queue_full_cancel_pending = True
+                else:
+                    print(
+                        "[FullyAsyncRollouter][Processor] "
+                        f"Received pause signal (reason={pause_reason or 'external'}), "
+                        "waiting for remaining tasks to return..."
+                    )
+                    while self.active_tasks:
+                        async with self.lock:
+                            # After acquiring the lock, the number of active_tasks may change, need to be verified again
+                            if self.active_tasks:
+                                done_tasks, self.active_tasks = await asyncio.wait(
+                                    self.active_tasks, return_when=asyncio.FIRST_COMPLETED
+                                )
+                            for task in done_tasks:
+                                await task
+
+                async with self.lock:
+                    while self.paused:
+                        self.idle_start_time = time.time()
+                        await self.condition.wait()
+                    # If we performed a queue_full cancel-based drain earlier,
+                    # clear the cancellation_event now that we are truly resuming.
+                    # This is safe because:
+                    # - Public pause()/resume() always calls resume_agent_loops()
+                    #   which clears the event on its own path.
+                    # - We only reach here after paused=False, meaning either
+                    #   monitor_loop released us (queue drained) or public resume()
+                    #   already ran.  In both cases the param-sync cancel contract
+                    #   is no longer active, so clearing is safe.
+                    if getattr(self, "_queue_full_cancel_pending", False):
+                        await self.async_rollout_manager.resume()
+                        self._queue_full_cancel_pending = False
+                continue
+
+            if self.feed_done and self.cancel_queue.empty() and self.pending_queue.empty():
+                if self.active_tasks:
                     async with self.lock:
-                        # After acquiring the lock, the number of active_tasks may change, need to be verified again
                         if self.active_tasks:
                             done_tasks, self.active_tasks = await asyncio.wait(
                                 self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                             )
                         for task in done_tasks:
                             await task
-
-                async with self.lock:
-                    while self.paused:
-                        self.idle_start_time = time.time()
-                        await self.condition.wait()
-                continue
+                    continue
+                print(
+                    "[FullyAsyncRollouter][Processor] "
+                    "Feed is done and all pending/cancel/active tasks are drained, exiting processor"
+                )
+                break
 
             simple_from_cancel_queue = False
             if not self.cancel_queue.empty():
@@ -526,21 +653,22 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 simple_from_cancel_queue = True
             else:
                 rollout_sample = await self.pending_queue.get()
+                if rollout_sample == "DONE":
+                    self.feed_done = True
+                    self.pending_queue.task_done()
+                    print(
+                        "[FullyAsyncRollouter][Processor] "
+                        "Received end signal, will exit after cancel_queue and active tasks are drained..."
+                    )
+                    continue
                 self.staleness_samples += 1
 
-            if rollout_sample == "DONE":
-                print(
-                    "[FullyAsyncRollouter][Processor] Received end signal, waiting for remaining tasks to complete..."
-                )
-                while self.active_tasks:
-                    async with self.lock:
-                        if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
-                        for task in done_tasks:
-                            await task
-                break
+            self._debug_partial(
+                f"dispatch sample_id={getattr(rollout_sample, 'sample_id', rollout_sample)} "
+                f"source={'cancel_queue' if simple_from_cancel_queue else 'pending_queue'} "
+                f"staleness_samples={self.staleness_samples} "
+                f"active_tasks={len(self.active_tasks)}"
+            )
 
             # Check whether the number of concurrent tasks exceeds the limit
             while len(self.active_tasks) >= self.max_concurrent_samples:
@@ -599,6 +727,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             rollout_sample.agent_loop_output_list = ret
             await self.cancel_queue.put(rollout_sample)
 
+        self._debug_partial(
+            f"sample_id={rollout_sample.sample_id} "
+            f"param_version={self.current_param_version} "
+            f"is_cancel={is_cancel} "
+            f"cancel_queue={self.cancel_queue.qsize()} "
+            f"active_tasks={len(self.active_tasks)}"
+        )
         self.processed_sample_count += 1
 
     async def _streaming_generation_main(self):
@@ -606,6 +741,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         if self.async_rollout_manager is None:
             await self._init_async_rollout_manager()
+
+        self.feed_done = False
 
         # Start the streaming loop
         print(f"[FullyAsyncRollouter] Start streaming mode, maximum concurrent samples: {self.max_concurrent_samples}")
@@ -713,13 +850,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             # Trigger rollout recovery
             if self.monitor_loop_trigger:
-                if not await self._should_pause_generation():
+                if await self._get_pause_reason() is None:
                     async with self.lock:
                         self.paused = False
                         self.condition.notify_all()
 
-    async def _should_pause_generation(self) -> bool:
-        """Determine whether the build should be paused"""
+    async def _get_pause_reason(self) -> str | None:
+        """Determine whether the build should be paused."""
         queue_stats = self.message_queue_client.get_statistics_sync()
         queue_size = queue_stats["queue_size"]
 
@@ -729,23 +866,47 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     f"[FullyAsyncRollouter][ShouldPause]  "
                     f"due to full queue: size={queue_size}, max={self.max_queue_size}"
                 )
-            return True
+            return "queue_full"
+
+        if self.enable_partial_rollout and not self.cancel_queue.empty():
+            self._debug_partial(
+                f"allow resume dispatch because cancel_queue={self.cancel_queue.qsize()} is waiting"
+            )
+            return None
 
         if self.staleness_samples >= self.max_required_samples:
+            if self.enable_partial_rollout:
+                if not self.paused:
+                    self._debug_partial(
+                        "ignore staleness pause in partial mode "
+                        f"staleness_samples={self.staleness_samples} "
+                        f"max_required_samples={self.max_required_samples} "
+                        f"max_concurrent_samples={self.max_concurrent_samples} "
+                        f"max_queue_size={self.max_queue_size}"
+                    )
+                return None
             if not self.paused:
                 print(
                     "[FullyAsyncRollouter][ShouldPause] "
                     f"due to "
                     f"staleness_samples {self.staleness_samples} >= max_required_samples {self.max_required_samples} "
                 )
-            return True
+            return "staleness"
 
-        return False
+        return None
 
     async def pause(self):
         """pause rollout"""
         print("[FullyAsyncRollouter][Public][Pause] partial rollout:", self.config.async_training.partial_rollout)
         async with self.lock:
+            self._debug_partial(
+                "pause requested "
+                f"param_version={self.current_param_version} "
+                f"active_tasks={len(self.active_tasks)} "
+                f"pending_queue={self.pending_queue.qsize()} "
+                f"cancel_queue={self.cancel_queue.qsize()} "
+                f"staleness_samples={self.staleness_samples}"
+            )
             self.paused = True
             # Cancel all rollout tasks
             if self.config.async_training.partial_rollout:
@@ -755,12 +916,17 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 await asyncio.gather(*self.active_tasks, return_exceptions=True)
                 self.active_tasks.clear()
                 print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
+            else:
+                self._debug_partial("pause observed no active tasks to gather")
 
-            # TODO use checkpoint engine for rollout clear_kv_cache
-            # print("[FullyAsyncRollouter][Public][Pause] clear kv cache")
-            # # Always clear KV cache to release GPU memory during weight synchronization,
-            # # regardless of partial_rollout setting.
-            # await self.async_rollout_manager.clear_kv_cache()
+            should_clear_kv_cache = self.total_generated_samples > 0
+            if should_clear_kv_cache:
+                print("[FullyAsyncRollouter][Public][Pause] clear kv cache")
+                # Clear rollout-side KV cache after all active tasks have drained so
+                # the next parameter version cannot reuse stale cache state.
+                await self.async_rollout_manager.clear_kv_cache()
+            else:
+                self._debug_partial("skip clear kv cache before first generated sample")
             self.monitor_loop_trigger = False
 
     async def resume(self, dependency_ref: ObjectRef = None):

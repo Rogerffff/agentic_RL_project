@@ -1,0 +1,25 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - carr_grpo_async_common
+  - _self_
+
+algorithm:
+  adv_estimator: grpo
+
+reward:
+  custom_reward_function:
+    path: examples/carr_deepsearch/reward/async_base_reward.py
+    name: compute_score
+
+async_training:
+  max_concurrent_samples: null
+  max_queue_size: null
+
+trainer:
+  experiment_name: carr-async-base-probe
+  default_local_dir: ${oc.env:HOME}/checkpoints/carr_deepsearch_async_base
+  validation_data_dir: ${oc.env:HOME}/eval_results/carr_deepsearch_async_base

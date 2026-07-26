@@ -16,6 +16,11 @@ top_k: -1
 # Top-p sampling parameter. Default 1.0.
 top_p: 1
 
+# Penalties forwarded to the inference backend when supported.
+repetition_penalty: 1.0
+presence_penalty: 0.0
+frequency_penalty: 0.0
+
 # typically the same as data max prompt length
 # same as data.max_prompt_length if it exists
 prompt_length: ${oc.select:data.max_prompt_length,512}
@@ -140,6 +145,11 @@ val_kwargs:
 
   # Top-p sampling parameter. Default 1.0.
   top_p: 1.0
+
+  # Penalties forwarded to the inference backend when supported.
+  repetition_penalty: 1.0
+  presence_penalty: 0.0
+  frequency_penalty: 0.0
 
   # Sampling temperature for rollout.
   temperature: 0

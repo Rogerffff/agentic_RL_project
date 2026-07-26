@@ -116,6 +116,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         self.message_queue_client = None
         self.param_synchronizer = None
+        self.debug_trainer_runtime = os.getenv("VERL_ASYNC_DEBUG_TRAINER", "0") == "1"
 
         # Statistics
         # we start from step 1
@@ -183,6 +184,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
     def set_total_train_steps(self, total_train_steps):
         self.total_train_steps = total_train_steps
         self.progress_bar = tqdm(total=self.total_train_steps, initial=0, desc="Training Progress")
+
+    def _debug_runtime(self, message: str):
+        if self.debug_trainer_runtime:
+            print(f"[FullyAsyncTrainer][DebugRuntime] {message}", flush=True)
 
     def get_actor_wg(self):
         """Get actor worker group"""
@@ -364,8 +369,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         ray.get(self.param_synchronizer.wait_last_valid.remote())
         self._log_validation_data()
         # 2. perform addtional parameter_sync and validate if trainer already updated
-        if self.current_param_version % self.config.rollout.test_freq != 0 or self.local_trigger_step > 1:
-            await self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps)
+        needs_final_sync = self.local_trigger_step > 1
+        if self.config.rollout.test_freq > 0:
+            needs_final_sync = needs_final_sync or self.current_param_version % self.config.rollout.test_freq != 0
+        if needs_final_sync:
+            await self._trigger_parameter_sync_after_step(validate=True)
             ray.get(self.param_synchronizer.wait_last_valid.remote())
             self._log_validation_data()
         self.progress_bar.close()
@@ -395,15 +403,68 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_start_profile()
 
         with marked_timer("step", self.timing_raw):
+            stage_start = time.time()
+            self._debug_runtime(f"global_steps={self.global_steps} enter generate")
             batch = self._fit_generate(None)
+            self._debug_runtime(
+                f"global_steps={self.global_steps} exit generate cost={time.time() - stage_start:.2f}s"
+            )
+
+            stage_start = time.time()
+            self._debug_runtime(f"global_steps={self.global_steps} enter reward")
             batch = self._fit_compute_reward(batch)
+            self._debug_runtime(
+                f"global_steps={self.global_steps} exit reward cost={time.time() - stage_start:.2f}s"
+            )
+
+            stage_start = time.time()
+            self._debug_runtime(f"global_steps={self.global_steps} enter log_prob")
             batch = self._fit_compute_log_prob(batch)
+            self._debug_runtime(
+                f"global_steps={self.global_steps} exit log_prob cost={time.time() - stage_start:.2f}s"
+            )
+
+            stage_start = time.time()
+            self._debug_runtime(f"global_steps={self.global_steps} enter ref_log_prob")
             batch = self._fit_compute_ref_log_prob(batch)
+            self._debug_runtime(
+                f"global_steps={self.global_steps} exit ref_log_prob cost={time.time() - stage_start:.2f}s"
+            )
+
+            stage_start = time.time()
+            self._debug_runtime(f"global_steps={self.global_steps} enter critic")
             batch = self._fit_compute_critic(batch)
+            self._debug_runtime(
+                f"global_steps={self.global_steps} exit critic cost={time.time() - stage_start:.2f}s"
+            )
+
+            stage_start = time.time()
+            self._debug_runtime(f"global_steps={self.global_steps} enter advantage")
             batch = self._fit_compute_advantage(batch)
+            self._debug_runtime(
+                f"global_steps={self.global_steps} exit advantage cost={time.time() - stage_start:.2f}s"
+            )
+
+            stage_start = time.time()
+            self._debug_runtime(f"global_steps={self.global_steps} enter update_critic")
             batch = self._fit_update_critic(batch)
+            self._debug_runtime(
+                f"global_steps={self.global_steps} exit update_critic cost={time.time() - stage_start:.2f}s"
+            )
+
+            stage_start = time.time()
+            self._debug_runtime(f"global_steps={self.global_steps} enter update_actor")
             batch = self._fit_update_actor(batch)
+            self._debug_runtime(
+                f"global_steps={self.global_steps} exit update_actor cost={time.time() - stage_start:.2f}s"
+            )
+
+            stage_start = time.time()
+            self._debug_runtime(f"global_steps={self.global_steps} enter update_weights")
             await self._fit_update_weights()
+            self._debug_runtime(
+                f"global_steps={self.global_steps} exit update_weights cost={time.time() - stage_start:.2f}s"
+            )
             self._fit_dump_data(batch)
 
         # self._fit_validate()

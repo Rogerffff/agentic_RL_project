@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import inspect
 import json
 import os
 import uuid
@@ -36,7 +37,6 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
@@ -66,6 +66,8 @@ from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+# ===== KL 惩罚：防止策略偏离参考模型太远 =====
+# 计算当前策略与参考策略之间的 KL 散度，将其作为惩罚项加入 token 级别的奖励中
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -108,6 +110,11 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
+# ===== Response Mask 计算 =====
+# response_mask 标识哪些 token 属于模型的回复部分
+# 在 Agent 训练中，AgentLoopManager 会提供更精细的 response_mask：
+#   1 = LLM 生成的 token（参与梯度计算）
+#   0 = 工具/环境插入的 token（不参与梯度计算）
 def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
 
@@ -126,6 +133,9 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+# ===== 优势函数计算 =====
+# 支持多种优势估计器：GAE（PPO）、GRPO（无 Critic）、REINFORCE++ 等
+# 所有计算都会乘以 response_mask，确保只在 LLM 生成的 token 上计算优势
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -210,6 +220,13 @@ def compute_advantage(
             # Get pre-computed rollout IS weights if available
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
+
+        # Conditionally pass non_tensor_batch only to estimators that accept it
+        _sig = inspect.signature(adv_estimator_fn)
+        if "non_tensor_batch" in _sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in _sig.parameters.values()
+        ):
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
 
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
@@ -300,8 +317,13 @@ class RayPPOTrainer:
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        self.debug_step_phases = os.environ.get("VERL_DEBUG_STEP_PHASES", "0") == "1"
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _debug_step_phase(self, phase: str, stage: str) -> None:
+        if self.debug_step_phases:
+            print(f"[phase-debug] step={self.global_steps} {phase} {stage}", flush=True)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -494,6 +516,9 @@ class RayPPOTrainer:
         return batch_reward
 
     def _validate(self, merged: bool = False):
+        # ===== 验证阶段 =====
+        # 验证也通过 AgentLoopManager 进行推理（self.async_rollout_manager.generate_sequences）
+        # 验证时使用 val_kwargs 中的温度和采样参数，支持多轮 Agent 交互的评估
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -534,23 +559,17 @@ class RayPPOTrainer:
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # pad to be divisible by dp_size
-            size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            test_output_gen_batch = self.async_rollout_manager.generate_sequences(test_gen_batch)
 
-            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+            if self.use_rm and "rm_scores" not in test_output_gen_batch.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
                 # to spare GPU memory for reward model
                 self.checkpoint_manager.sleep_replicas()
-                batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
-                test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
+                batch_reward = self._compute_reward_colocate(test_output_gen_batch)
+                test_output_gen_batch = test_output_gen_batch.union(batch_reward)
                 # wake up rollout model
                 # replace with wake_up method once supported
                 self.checkpoint_manager.update_weights()
-
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             print("validation generation end")
 
@@ -801,6 +820,8 @@ class RayPPOTrainer:
         # create reward loop manager
         from verl.experimental.reward_loop import RewardLoopManager
 
+        # ===== 初始化奖励计算管理器 =====
+        # RewardLoopManager: 管理奖励模型的计算，支持流式奖励（在 rollout 过程中同步计算奖励）
         # initalize reward loop manager
         # reward model (colocate or standalone): get resource_pool
         # no reward model: resource_pool = None
@@ -810,6 +831,12 @@ class RayPPOTrainer:
             rm_resource_pool=resource_pool,
         )
 
+        # ===== 初始化 Agent Rollout 管理器（核心！） =====
+        # AgentLoopManager 是 Agent 训练的核心组件，完全接管 rollout 阶段：
+        #   - 管理多个推理引擎副本（vLLM/SGLang）用于 LLM 推理
+        #   - 管理多个 AgentLoopWorker（Ray actor）并发处理样本
+        #   - 每个样本运行 ToolAgentLoop 状态机：LLM生成 → 工具调用 → 继续生成 → ... → 终止
+        #   - 返回带有 response_mask 的 DataProto，区分 LLM token 和工具 token
         # create async rollout manager and request scheduler
         # Note: mode is always "async" since sync mode is deprecated
         self.async_rollout_mode = True
@@ -1124,6 +1151,8 @@ class RayPPOTrainer:
         return ref_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
+        actor_config = self.config.actor_rollout_ref.actor
+        calculate_entropy = actor_config.calculate_entropy or (actor_config.entropy_coeff != 0.0)
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
             # step 1: convert dataproto to tensordict.
@@ -1131,19 +1160,23 @@ class RayPPOTrainer:
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
-            tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
+            tu.assign_non_tensor(batch_td, calculate_entropy=calculate_entropy, compute_loss=False)
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
             # gather output
-            entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
             old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
             # step 4. No padding to padding
-            entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
             # step 5: rebuild a tensordict and convert to dataproto
-            old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
+            tensors = {"old_log_probs": log_probs.float()}
+            if calculate_entropy:
+                entropy = tu.get(output, "entropy")
+                entropy = no_padding_2_padding(entropy, batch_td)
+                tensors["entropys"] = entropy.float()
+            old_log_prob = tu.get_tensordict(tensors)
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
+            batch.meta_info["calculate_entropy"] = calculate_entropy
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
@@ -1233,6 +1266,9 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        # ===== PPO 训练主循环 =====
+        # 整体流程：加载权重 → [Rollout生成 → 计算奖励 → 计算log概率 → 计算优势 → 更新Actor/Critic → 同步权重] × N
+        # Agent 训练时，Rollout 阶段由 AgentLoopManager 接管，运行多轮工具调用的状态机
         self.global_steps = 0
 
         # load checkpoint and update weights before doing anything
@@ -1284,6 +1320,8 @@ class RayPPOTrainer:
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
+                # ===== 批次准备 =====
+                # 从数据集加载一个 batch，添加 uid 和温度等元信息
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
@@ -1302,6 +1340,12 @@ class RayPPOTrainer:
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
+                    # ===== Step 1: Rollout 生成（Agent Loop 接管点） =====
+                    # 调用 AgentLoopManager.generate_sequences()：
+                    #   - 将 batch 分发给多个 AgentLoopWorker
+                    #   - 每个 Worker 内部并发运行 ToolAgentLoop 状态机处理每个样本
+                    #   - 状态机流程：PENDING → GENERATING → PROCESSING_TOOLS → GENERATING → ... → TERMINATED
+                    #   - 返回包含 responses、response_mask（1=LLM token, 0=工具token）、log_probs 的 DataProto
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
@@ -1364,6 +1408,10 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
+                    # ===== Step 2: 计算奖励 =====
+                    # 如果启用了流式奖励（enable_agent_reward_loop），奖励已在 rollout 阶段计算完毕
+                    # 否则在这里通过 reward model 或 reward function 计算
+                    self._debug_step_phase("begin", "reward")
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1372,7 +1420,12 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                    self._debug_step_phase("end", "reward")
 
+                    # ===== Step 3: 计算 Old Log Probs（重要性采样的分母） =====
+                    # PPO 需要计算"旧策略"的 log 概率，用于重要性采样比率 π_θ/π_old
+                    # Bypass 模式：直接用 rollout 时的 log_probs（2 个策略）
+                    # Decoupled 模式：重新前向传播计算（3 个策略，更稳定）
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -1388,23 +1441,25 @@ class RayPPOTrainer:
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
                     else:  # Recompute old_log_probs
+                        self._debug_step_phase("begin", "old_log_prob")
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch.batch["response_mask"]
-                            actor_config = self.config.actor_rollout_ref.actor
-                            entropy_agg = agg_loss(
-                                loss_mat=entropys,
-                                loss_mask=response_masks,
-                                loss_agg_mode=actor_config.loss_agg_mode,
-                                loss_scale_factor=actor_config.loss_scale_factor,
-                            )
                             old_log_prob_metrics = {
-                                "actor/entropy": entropy_agg.detach().item(),
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
+                            if "entropys" in old_log_prob.batch:
+                                entropys = old_log_prob.batch["entropys"]
+                                response_masks = batch.batch["response_mask"]
+                                actor_config = self.config.actor_rollout_ref.actor
+                                entropy_agg = agg_loss(
+                                    loss_mat=entropys,
+                                    loss_mask=response_masks,
+                                    loss_agg_mode=actor_config.loss_agg_mode,
+                                    loss_scale_factor=actor_config.loss_scale_factor,
+                                )
+                                old_log_prob_metrics["actor/entropy"] = entropy_agg.detach().item()
                             metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
+                            old_log_prob.batch.pop("entropys", None)
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 router_mode = getattr(
                                     self.config.actor_rollout_ref.actor.router_replay, "mode", "disabled"
@@ -1419,21 +1474,36 @@ class RayPPOTrainer:
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
+                        self._debug_step_phase("end", "old_log_prob")
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
+                    # ===== Step 4: 参考策略 Log Prob（KL 约束） =====
+                    # 计算冻结的参考模型的 log 概率，用于 KL 散度惩罚，防止策略漂移过远
                     if self.use_reference_policy:
                         # compute reference log_prob
+                        self._debug_step_phase("begin", str(Role.RefPolicy))
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+                        self._debug_step_phase("end", str(Role.RefPolicy))
 
+                    # ===== Step 5: Critic 估值（仅 PPO 需要，GRPO 不需要） =====
+                    # Critic 网络估计每个 token 的状态价值 V(s)，用于 GAE 优势计算
                     # compute values
                     if self.use_critic:
+                        self._debug_step_phase("begin", "values")
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self._compute_values(batch)
                             batch = batch.union(values)
+                        self._debug_step_phase("end", "values")
 
+                    # ===== Step 6: 计算优势函数 =====
+                    # 将奖励信号转化为优势估计 A(s,a)，指导策略更新方向
+                    # GAE: 需要 Critic 的 V(s)，适合 PPO
+                    # GRPO: 组内相对优势，无需 Critic，适合 Agent 训练
+                    # 所有优势计算都使用 response_mask，只在 LLM 生成的 token 上计算
+                    self._debug_step_phase("begin", "adv")
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
@@ -1480,19 +1550,27 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                    self._debug_step_phase("end", "adv")
 
+                    # ===== Step 7: 更新 Critic（仅 PPO） =====
                     # update critic
                     if self.use_critic:
+                        self._debug_step_phase("begin", "update_critic")
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
+                        self._debug_step_phase("end", "update_critic")
 
+                    # ===== Step 8: 更新 Actor（策略梯度） =====
+                    # Critic warmup 期间只更新 Critic，不更新 Actor
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
+                        self._debug_step_phase("begin", "update_actor")
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
+                        self._debug_step_phase("end", "update_actor")
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -1516,9 +1594,14 @@ class RayPPOTrainer:
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
 
+                        # ===== Step 10: 同步权重到推理引擎 =====
+                        # 将训练后的新权重同步到 AgentLoopManager 管理的推理引擎副本
+                        # 下一轮 rollout 会使用更新后的策略进行生成
                         # update weights from trainer to rollout
+                        self._debug_step_phase("begin", "update_weights")
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights()
+                        self._debug_step_phase("end", "update_weights")
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

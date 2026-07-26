@@ -53,7 +53,8 @@ class ParameterSynchronizer:
         self._init_weights_info()
         self._init_sync_group()
 
-        if self.config.async_training.checkpoint_engine.enable:
+        rollout_name = getattr(self.config.actor_rollout_ref.rollout, "name", None)
+        if self.config.async_training.checkpoint_engine.enable and rollout_name != "sglang":
             self._init_actor_rollout_checkpoint_engine()
 
     def get_current_param_version(self) -> int:
@@ -114,6 +115,51 @@ class ParameterSynchronizer:
             )
         )
 
+    def _get_group_sync_fingerprint(self, worker_group, group_name: str):
+        fingerprints = worker_group.get_last_sync_fingerprint()
+        fingerprints = [fp for fp in fingerprints if fp is not None]
+        if not fingerprints:
+            raise RuntimeError(f"[ParameterSynchronizer] Missing sync fingerprint for {group_name}")
+
+        unique = {
+            (
+                fp.get("digest"),
+                fp.get("tensor_count"),
+                fp.get("sampled_tensor_count"),
+                fp.get("total_numel"),
+            )
+            for fp in fingerprints
+        }
+        if len(unique) != 1:
+            raise RuntimeError(f"[ParameterSynchronizer] Inconsistent sync fingerprint within {group_name}: {fingerprints}")
+        return fingerprints[0]
+
+    def _validate_sync_fingerprints(self):
+        actor_fp = self._get_group_sync_fingerprint(self.actor_wg, "actor")
+        rollout_fp = self._get_group_sync_fingerprint(self.rollout_wg, "rollout")
+        actor_sig = (
+            actor_fp.get("digest"),
+            actor_fp.get("tensor_count"),
+            actor_fp.get("sampled_tensor_count"),
+            actor_fp.get("total_numel"),
+        )
+        rollout_sig = (
+            rollout_fp.get("digest"),
+            rollout_fp.get("tensor_count"),
+            rollout_fp.get("sampled_tensor_count"),
+            rollout_fp.get("total_numel"),
+        )
+        if actor_sig != rollout_sig:
+            raise RuntimeError(
+                "[ParameterSynchronizer] Actor and rollout sync fingerprints diverged: "
+                f"actor={actor_fp}, rollout={rollout_fp}"
+            )
+        print(
+            "[ParameterSynchronizer] fingerprint validated: "
+            f"digest={actor_fp['digest'][:12]} sampled_tensors={actor_fp['sampled_tensor_count']} "
+            f"tensor_count={actor_fp['tensor_count']}"
+        )
+
     def sync_weights(self, version, validate=False, global_steps=0, use_trainer_do_validate=False):
         """Sync weights between trainer and rollouter, and update parameter version"""
         start_time = time.time()
@@ -128,17 +174,15 @@ class ParameterSynchronizer:
         pause_time = time.time()
 
         # sync weights
-        # For sglang, always use sync_rollout_weights instead of sync_rollout_weights_by_checkpoint
-
-        # TODO use checkpoint engine for sglang rollout
-        # rollout_name = getattr(self.config.actor_rollout_ref.rollout, "name", None)
-        # use_checkpoint_engine = self.config.async_training.checkpoint_engine.enable and rollout_name != "sglang"
-        # if use_checkpoint_engine:
-        #     self.actor_wg.sync_rollout_weights_by_checkpoint(self.sync_group_name)
-        #     ray.get(self.rollout_wg.sync_rollout_weights_by_checkpoint(self.sync_group_name))
-        # else:
-        #     self.actor_wg.sync_rollout_weights(self.sync_group_name)
-        #     ray.get(self.rollout_wg.sync_rollout_weights(self.sync_group_name))
+        rollout_name = getattr(self.config.actor_rollout_ref.rollout, "name", None)
+        use_checkpoint_engine = self.config.async_training.checkpoint_engine.enable and rollout_name != "sglang"
+        if use_checkpoint_engine:
+            self.actor_wg.sync_rollout_weights_by_checkpoint(self.sync_group_name)
+            ray.get(self.rollout_wg.sync_rollout_weights_by_checkpoint(self.sync_group_name))
+        else:
+            self.actor_wg.sync_rollout_weights(self.sync_group_name)
+            ray.get(self.rollout_wg.sync_rollout_weights(self.sync_group_name))
+        self._validate_sync_fingerprints()
 
         end_time = time.time()
         print(

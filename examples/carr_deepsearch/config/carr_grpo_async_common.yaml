@@ -1,0 +1,84 @@
+data:
+  train_files: examples/carr_deepsearch/data/rl_train.parquet
+  val_files: examples/carr_deepsearch/data/rl_val.parquet
+  return_raw_chat: true
+  max_prompt_length: 4096
+  max_response_length: 4096
+  train_batch_size: 0
+  gen_batch_size: 1
+  val_batch_size: 16
+  apply_chat_template_kwargs:
+    enable_thinking: true
+
+actor_rollout_ref:
+  hybrid_engine: false
+  model:
+    path: ${oc.env:SFT_MODEL_PATH}
+    enable_gradient_checkpointing: true
+    trust_remote_code: true
+    use_remove_padding: true
+  actor:
+    strategy: fsdp
+    fsdp_config:
+      model_dtype: bf16
+    # Disable dynamic micro-batch packing for async probes because per-rank
+    # packing divergence can desynchronize FSDP collectives in update_actor.
+    use_dynamic_bsz: false
+    ppo_max_token_len_per_gpu: 8192
+    optim:
+      lr: 2.0e-6
+    ppo_mini_batch_size: 4
+    ppo_micro_batch_size_per_gpu: 2
+    use_rollout_log_probs: true
+  rollout:
+    name: sglang
+    mode: async
+    temperature: 1.0
+    top_p: 1.0
+    n: 4
+    load_format: auto
+    gpu_memory_utilization: 0.5
+    free_cache_engine: false
+    calculate_log_probs: true
+    multi_turn:
+      enable: false
+  ref:
+    fsdp_config:
+      model_dtype: bf16
+    log_prob_micro_batch_size_per_gpu: 2
+
+async_training:
+  staleness_threshold: 0.0
+  trigger_parameter_sync_step: 2
+  require_batches: 1
+  partial_rollout: false
+  use_trainer_do_validate: false
+  checkpoint_engine:
+    enable: false
+
+algorithm:
+  use_kl_in_reward: false
+  kl_penalty: kl
+  rollout_correction:
+    bypass_mode: true
+
+reward:
+  reward_model:
+    enable: false
+
+trainer:
+  nnodes: 1
+  n_gpus_per_node: 4
+  total_epochs: 1
+  save_freq: 0
+  test_freq: 0
+  project_name: carr_deepsearch
+  logger: ['console', 'wandb']
+
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 4
+  n: ${actor_rollout_ref.rollout.n}
+  total_rollout_steps: 32
+  total_epochs: 1
+  test_freq: 0

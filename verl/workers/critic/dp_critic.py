@@ -37,13 +37,47 @@ from verl.workers.critic import BasePPOCritic
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+DEBUG_ASYNC_TRAINER_RUNTIME = os.getenv("VERL_ASYNC_DEBUG_TRAINER", "0") == "1"
+
+
+def _critic_debug_runtime(message: str):
+    if not DEBUG_ASYNC_TRAINER_RUNTIME:
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    print(f"[DPCritic][DebugRuntime] rank={rank} {message}", flush=True)
+
+
+def _get_local_max_seq_len(batch: dict[str, torch.Tensor]) -> int:
+    input_ids = batch["input_ids"]
+    if getattr(input_ids, "is_nested", False):
+        seq_len_effective = input_ids.offsets().diff()
+        return int(seq_len_effective.max().item()) if seq_len_effective.numel() > 0 else 0
+
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is not None:
+        return int(attention_mask.sum(dim=1).max().item()) if attention_mask.numel() > 0 else 0
+
+    return int(input_ids.shape[-1]) if input_ids.ndim >= 2 else 0
+
+
+def _get_total_response_tokens(batch: dict[str, torch.Tensor]) -> int:
+    response_mask = batch.get("response_mask")
+    if response_mask is not None:
+        return int(response_mask.sum().item())
+
+    responses = batch.get("responses")
+    if responses is not None:
+        return int(responses.numel())
+
+    return 0
 
 
 class DataParallelPPOCritic(BasePPOCritic):
-    def __init__(self, config, critic_module: nn.Module, critic_optimizer: optim.Optimizer):
+    def __init__(self, config, critic_module: nn.Module, critic_optimizer: optim.Optimizer, dp_group=None):
         super().__init__(config=config)
         self.critic_module = critic_module
         self.critic_optimizer = critic_optimizer
+        self.dp_group = dp_group
         self.use_remove_padding = self.config.model.get("use_remove_padding", False)
         print(f"Critic use_remove_padding={self.use_remove_padding}")
 
@@ -166,7 +200,19 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         if use_dynamic_bsz:
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+            local_max_seq_len = _get_local_max_seq_len(data.batch)
+            total_response_tokens = _get_total_response_tokens(data.batch)
+            micro_batches, batch_idx_list = prepare_dynamic_batch(
+                data,
+                max_token_len=max_token_len,
+                dp_group=self.dp_group,
+                same_micro_num_in_dp=True,
+            )
+            _critic_debug_runtime(
+                "compute_values dynamic_bsz "
+                f"len(micro_batches)={len(micro_batches)} max_token_len={max_token_len} "
+                f"local_max_seq_len={local_max_seq_len} total_response_tokens={total_response_tokens}"
+            )
         else:
             micro_batches = data.split(micro_batch_size)
 
@@ -210,7 +256,19 @@ class DataParallelPPOCritic(BasePPOCritic):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    local_max_seq_len = _get_local_max_seq_len(mini_batch.batch)
+                    total_response_tokens = _get_total_response_tokens(mini_batch.batch)
+                    micro_batches, _ = prepare_dynamic_batch(
+                        mini_batch,
+                        max_token_len=max_token_len,
+                        dp_group=self.dp_group,
+                        same_micro_num_in_dp=True,
+                    )
+                    _critic_debug_runtime(
+                        f"mini_batch={batch_idx} dynamic_bsz "
+                        f"len(micro_batches)={len(micro_batches)} max_token_len={max_token_len} "
+                        f"local_max_seq_len={local_max_seq_len} total_response_tokens={total_response_tokens}"
+                    )
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu

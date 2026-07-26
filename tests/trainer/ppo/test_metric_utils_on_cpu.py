@@ -541,6 +541,24 @@ class TestProcessValidationMetrics(unittest.TestCase):
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
 
+    def test_process_validation_metrics_skips_none_and_categorical_fields(self):
+        """Categorical validation fields must not be reduced as numeric metrics."""
+        data_sources = ["source1"] * 5
+        sample_inputs = [f"prompt{i}" for i in range(5)]
+        infos_dict = {
+            "reward": [1.0, 0.0, 0.5, 0.0, 0.0],
+            "task_unfinished": [False, True, False, True, True],
+            "termination_reason": ["response_limit", None, "assistant_turn_limit", None, "response_limit"],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertIn("reward", result["source1"])
+        self.assertIn("task_unfinished", result["source1"])
+        self.assertNotIn("termination_reason", result["source1"])
+        self.assertAlmostEqual(result["source1"]["reward"]["mean@1"], 0.3)
+        self.assertAlmostEqual(result["source1"]["task_unfinished"]["mean@1"], 0.6)
+
 
 if __name__ == "__main__":
     unittest.main()

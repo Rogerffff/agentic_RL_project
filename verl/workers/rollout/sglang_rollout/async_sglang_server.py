@@ -92,10 +92,17 @@ class SGLangHttpServer:
             self.config.max_model_len = max_position_embeddings
         else:
             if self.config.max_model_len > max_position_embeddings:
-                raise ValueError(
-                    f"max_model_len ({self.config.max_model_len}) should be less than or equal to "
-                    f"max_position_embeddings ({max_position_embeddings})"
-                )
+                has_rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", None) is not None
+                if has_rope_scaling:
+                    logger.warning(
+                        f"max_model_len ({self.config.max_model_len}) > max_position_embeddings ({max_position_embeddings}). "
+                        f"Allowing because model has rope_scaling configured. The backend will handle context extension."
+                    )
+                else:
+                    raise ValueError(
+                        f"max_model_len ({self.config.max_model_len}) > max_position_embeddings ({max_position_embeddings}) "
+                        f"and model has no rope_scaling. Either reduce max_model_len or configure rope_scaling."
+                    )
         self.rollout_mode = rollout_mode
         self.workers = workers
 
@@ -194,6 +201,7 @@ class SGLangHttpServer:
             "mm_attention_backend": "fa3",
             "attention_backend": attention_backend if attention_backend is not None else "fa3",
             "skip_tokenizer_init": self.config.skip_tokenizer_init,
+            "context_length": self.config.max_model_len,
             "skip_server_warmup": True,
             "quantization": quantization,
             "json_model_override_args": json.dumps({"quantization_config": fp8_block_quant_kwargs})

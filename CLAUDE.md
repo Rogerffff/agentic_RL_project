@@ -2,6 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## CaRR DeepSearch Project Entry
+
+The main custom project in this fork is `examples/carr_deepsearch/`. Its training
+and minimum resume-oriented evaluation are complete; it is not an active
+training run. For current status, measured results, local-only assets, and
+new-Mac migration instructions, start with:
+
+- `examples/carr_deepsearch/AGENT.md`
+- `examples/carr_deepsearch/docs/resume_source_of_truth_20260412.md`
+- `examples/carr_deepsearch/docs/training_full_history_20260404.md`
+- `examples/carr_deepsearch/docs/eval_analysis_20260415.md`
+- `examples/carr_deepsearch/docs/new_mac_migration_20260726.md`
+
+The authoritative Git branch is `feature/carr-deepsearch`. Older GPU plans are
+historical unless a new task explicitly asks for additional training or
+evaluation.
+
 ## What is verl?
 
 verl (Volcano Engine Reinforcement Learning for LLMs) is an open-source RL post-training library for large language models. It implements the HybridFlow architecture (EuroSys 2025) which decouples computation and data dependencies to enable flexible RL dataflows (PPO, GRPO, DAPO, REINFORCE++, etc.) on top of existing LLM infrastructure. Initiated by ByteDance Seed team.

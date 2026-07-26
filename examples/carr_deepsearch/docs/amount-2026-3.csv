@@ -1,0 +1,5 @@
+﻿user_id,utc_date,model,api_key_name,api_key,type,price,amount
+3e0079c9-9f4c-4603-8d5a-71250460a000,2026-03-05,deepseek-chat,CaRR Deep Search,sk-a349d***********************499e,output_tokens,0.000003,510638
+3e0079c9-9f4c-4603-8d5a-71250460a000,2026-03-05,deepseek-chat,CaRR Deep Search,sk-a349d***********************499e,request_count,,1907
+3e0079c9-9f4c-4603-8d5a-71250460a000,2026-03-05,deepseek-chat,CaRR Deep Search,sk-a349d***********************499e,input_cache_hit_tokens,0.0000002,1093760
+3e0079c9-9f4c-4603-8d5a-71250460a000,2026-03-05,deepseek-chat,CaRR Deep Search,sk-a349d***********************499e,input_cache_miss_tokens,0.000002,2417333

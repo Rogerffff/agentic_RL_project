@@ -1,0 +1,75 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - carr_grpo_async_common
+  - _self_
+
+data:
+  max_response_length: 61440
+
+actor_rollout_ref:
+  actor:
+    ppo_max_token_len_per_gpu: 24576
+  rollout:
+    free_cache_engine: false
+    multi_turn:
+      enable: true
+      format: hermes
+      max_assistant_turns: 30
+      max_tool_response_length: 10000
+      tool_response_truncate_side: right
+      tool_config_path: examples/carr_deepsearch/config/tool_config/carr_browser_tools.yaml
+    agent:
+      default_agent_loop: carr_tool_agent
+    custom:
+      fully_async_agent_loop_name: carr_async_partial_tool_agent
+      carr_budget:
+        max_rollout_wall_time_s: 360
+        max_real_rollout_wall_time_s: 720
+        max_param_span: 2
+        max_tool_calls: 88
+        max_search_calls: 40
+        max_open_calls: 32
+        max_find_calls: 20
+
+async_training:
+  staleness_threshold: 0.0
+  partial_rollout: false
+  max_concurrent_samples: null
+  max_queue_size: null
+  checkpoint_engine:
+    enable: false
+
+algorithm:
+  adv_estimator: cgrpo
+  cgrpo_alpha: 0.3
+
+reward:
+  reward_model:
+    enable: false
+  custom_reward_function:
+    path: examples/carr_deepsearch/reward/carr_reward.py
+    name: compute_score
+
+trainer:
+  nnodes: 1
+  n_gpus_per_node: 4
+  total_epochs: 1
+  save_freq: 0
+  test_freq: 0
+  project_name: carr_deepsearch
+  logger: ['console', 'wandb']
+  experiment_name: carr-async-sync-stream
+  default_local_dir: ${oc.env:HOME}/checkpoints/carr_deepsearch_async
+  validation_data_dir: ${oc.env:HOME}/eval_results/carr_deepsearch_async
+
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 4
+  n: ${actor_rollout_ref.rollout.n}
+  total_rollout_steps: 32
+  total_epochs: 1
+  test_freq: 0

@@ -23,6 +23,7 @@ import pandas as pd
 import pytest
 import torch
 from PIL import Image
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -34,6 +35,174 @@ from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.model import extract_multi_modal_inputs
 
 custom_model_prefix = Path("~/models").expanduser().resolve()
+
+
+class FakeReasoningTokenizer:
+    pad_token_id = 0
+
+    def apply_chat_template(
+        self,
+        messages,
+        tools=None,
+        add_generation_prompt=False,
+        tokenize=False,
+        return_dict=False,
+        return_tensors=None,
+        **kwargs,
+    ):
+        rendered = []
+        if tools:
+            rendered.append("<|im_start|>system\n<tools>stub</tools><|im_end|>\n")
+
+        for message in messages:
+            role = message["role"]
+            if role == "user":
+                rendered.append(f"<|im_start|>user\n{message.get('content', '')}<|im_end|>\n")
+            elif role == "tool":
+                rendered.append(
+                    f"<|im_start|>user\n<tool_response>{message.get('content', '')}</tool_response><|im_end|>\n"
+                )
+            elif role == "assistant":
+                assistant_text = "<|im_start|>assistant\n"
+                # Simulate Qwen's problematic behavior: isolated assistant+tool_call messages
+                # drop reasoning_content unless rendered in conversation context.
+                include_reasoning = not (len(messages) == 1 and message.get("tool_calls"))
+                if include_reasoning and message.get("reasoning_content"):
+                    assistant_text += f"<think>{message['reasoning_content']}</think>\n"
+                if message.get("tool_calls"):
+                    for tool_call in message["tool_calls"]:
+                        assistant_text += (
+                            f"<tool_call>{{\"name\": \"{tool_call['function']['name']}\"}}</tool_call>\n"
+                        )
+                if message.get("content"):
+                    assistant_text += message["content"]
+                assistant_text += "<|im_end|>\n"
+                rendered.append(assistant_text)
+            else:
+                raise ValueError(f"Unsupported role: {role}")
+
+        if add_generation_prompt:
+            rendered.append("<|im_start|>assistant\n")
+
+        text = "".join(rendered)
+        if not tokenize:
+            return text
+
+        token_ids = [ord(char) for char in text]
+        if return_dict:
+            return {
+                "input_ids": torch.tensor([token_ids], dtype=torch.long),
+                "attention_mask": torch.ones((1, len(token_ids)), dtype=torch.long),
+            }
+        return token_ids
+
+    def decode(self, token_ids):
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.tolist()
+        return "".join(chr(int(token_id)) for token_id in token_ids if int(token_id) != self.pad_token_id)
+
+
+def test_multiturn_sft_dataset_preserves_reasoning_in_training_path(tmp_path):
+    parquet_path = tmp_path / "reasoning.parquet"
+    df = pd.DataFrame(
+        {
+            "messages": [
+                [
+                    {"role": "user", "content": "Solve the task."},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "plan the search",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "id": "call-1",
+                                "function": {"name": "browser.search", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "content": "Search result content"},
+                    {
+                        "role": "assistant",
+                        "content": "## Exact Answer\n42",
+                        "reasoning_content": "use the retrieved evidence",
+                        "tool_calls": None,
+                    },
+                ]
+            ],
+            "tools": [
+                [{"type": "function", "function": {"name": "browser.search", "parameters": {"type": "object"}}}]
+            ],
+            "enable_thinking": [True],
+        }
+    )
+    df.to_parquet(parquet_path)
+
+    dataset = MultiTurnSFTDataset(
+        parquet_files=str(parquet_path),
+        tokenizer=FakeReasoningTokenizer(),
+        config=OmegaConf.create(
+            {
+                "max_length": 4096,
+                "truncation": "error",
+                "messages_key": "messages",
+                "tools_key": "tools",
+                "enable_thinking_key": "enable_thinking",
+            }
+        ),
+    )
+
+    item = dataset[0]
+    loss_text = dataset.tokenizer.decode(item["input_ids"][item["loss_mask"] == 1])
+    assert "<think>plan the search</think>" in loss_text
+    assert "<tool_call>" in loss_text
+    assert "## Exact Answer" in loss_text
+
+
+def test_multiturn_sft_dataset_loss_window_keeps_more_supervised_tokens(tmp_path):
+    parquet_path = tmp_path / "loss_window.parquet"
+    early_answer = "EARLY-" * 8
+    long_tool_observation = "tool-noise-" * 80
+    final_answer = "FINAL-" * 20
+    df = pd.DataFrame(
+        {
+            "messages": [
+                [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": early_answer, "reasoning_content": None, "tool_calls": None},
+                    {"role": "tool", "content": long_tool_observation},
+                    {"role": "assistant", "content": final_answer, "reasoning_content": None, "tool_calls": None},
+                ]
+            ]
+        }
+    )
+    df.to_parquet(parquet_path)
+
+    common_config = {
+        "max_length": 180,
+        "messages_key": "messages",
+        "pad_mode": "no_padding",
+    }
+    tokenizer = FakeReasoningTokenizer()
+
+    right_dataset = MultiTurnSFTDataset(
+        parquet_files=str(parquet_path),
+        tokenizer=tokenizer,
+        config=OmegaConf.create({**common_config, "truncation": "right"}),
+    )
+    loss_window_dataset = MultiTurnSFTDataset(
+        parquet_files=str(parquet_path),
+        tokenizer=tokenizer,
+        config=OmegaConf.create({**common_config, "truncation": "loss_window"}),
+    )
+
+    right_loss_text = tokenizer.decode(right_dataset[0]["input_ids"][right_dataset[0]["loss_mask"] == 1])
+    loss_window_text = tokenizer.decode(
+        loss_window_dataset[0]["input_ids"][loss_window_dataset[0]["loss_mask"] == 1]
+    )
+
+    assert final_answer not in right_loss_text
+    assert final_answer in loss_window_text
 
 
 @pytest.mark.parametrize(

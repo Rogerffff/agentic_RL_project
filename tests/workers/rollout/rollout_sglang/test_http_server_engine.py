@@ -57,6 +57,7 @@ from verl.workers.rollout.sglang_rollout.http_server_engine import (
     HttpServerAdapter,
     launch_server_process,
 )
+from verl.workers.rollout.sglang_rollout.utils import ensure_sglang_flush_cache_succeeded
 
 
 @pytest.fixture(scope="session")
@@ -976,3 +977,12 @@ class TestIntegration:
             )
             result = adapter.update_weights_from_tensor(req)
             assert result == {}
+
+
+class TestFlushValidation:
+    def test_ensure_sglang_flush_cache_succeeded_accepts_success(self):
+        ensure_sglang_flush_cache_succeeded({"cache_flushed": True}, "test")
+
+    def test_ensure_sglang_flush_cache_succeeded_rejects_empty_response(self):
+        with pytest.raises(RuntimeError, match="flush_cache failed"):
+            ensure_sglang_flush_cache_succeeded({}, "test")

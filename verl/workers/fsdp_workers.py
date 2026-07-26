@@ -93,6 +93,7 @@ from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManage
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+DEBUG_ASYNC_TRAINER_RUNTIME = os.getenv("VERL_ASYNC_DEBUG_TRAINER", "0") == "1"
 
 device_name = get_device_name()
 
@@ -910,8 +911,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
+            actor_dp_group = self.ulysses_device_mesh["dp"].get_group() if self.ulysses_device_mesh is not None else dist.group.WORLD
             self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                config=actor_cfg,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                dp_group=actor_dp_group,
             )
 
         if self._is_rollout:
@@ -955,7 +960,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.ref.use_fused_kernels = use_fused_kernels
                 if use_prefix_grouper:
                     self.config.ref.use_prefix_grouper = use_prefix_grouper
-            self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+            ref_dp_group = self.ulysses_device_mesh["dp"].get_group() if self.ulysses_device_mesh is not None else dist.group.WORLD
+            self.ref_policy = DataParallelPPOActor(
+                config=self.config.ref,
+                actor_module=self.ref_module_fsdp,
+                dp_group=ref_dp_group,
+            )
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -985,18 +995,55 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        if DEBUG_ASYNC_TRAINER_RUNTIME:
+            global_token_num = data.meta_info.get("global_token_num", None)
+            response_mask = data.batch.get("response_mask", None)
+            response_tokens = None
+            if response_mask is not None:
+                response_tokens = int(response_mask.sum().item())
+            print(
+                "[FSDPActorWorker][DebugRuntime] "
+                f"rank={dist.get_rank() if dist.is_initialized() else -1} "
+                f"enter update_actor global_token_num={global_token_num} response_tokens={response_tokens}",
+                flush=True,
+            )
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            if DEBUG_ASYNC_TRAINER_RUNTIME:
+                print(
+                    "[FSDPActorWorker][DebugRuntime] "
+                    f"rank={dist.get_rank() if dist.is_initialized() else -1} loaded actor params to gpu",
+                    flush=True,
+                )
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+            if DEBUG_ASYNC_TRAINER_RUNTIME:
+                print(
+                    "[FSDPActorWorker][DebugRuntime] "
+                    f"rank={dist.get_rank() if dist.is_initialized() else -1} loaded actor optimizer to gpu",
+                    flush=True,
+                )
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
             data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
             # perform training
+            if DEBUG_ASYNC_TRAINER_RUNTIME:
+                print(
+                    "[FSDPActorWorker][DebugRuntime] "
+                    f"rank={dist.get_rank() if dist.is_initialized() else -1} before actor.update_policy",
+                    flush=True,
+                )
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
+            if DEBUG_ASYNC_TRAINER_RUNTIME:
+                print(
+                    "[FSDPActorWorker][DebugRuntime] "
+                    f"rank={dist.get_rank() if dist.is_initialized() else -1} "
+                    f"after actor.update_policy cost={delta_time:.2f}s",
+                    flush=True,
+                )
             global_num_tokens = data.meta_info["global_token_num"]
             images_seqlens = data.meta_info.get("images_seqlens", None)
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(
@@ -1017,13 +1064,31 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             output = DataProto(meta_info={"metrics": metrics})
 
             output = output.to("cpu")
+            if DEBUG_ASYNC_TRAINER_RUNTIME:
+                print(
+                    "[FSDPActorWorker][DebugRuntime] "
+                    f"rank={dist.get_rank() if dist.is_initialized() else -1} actor output moved to cpu",
+                    flush=True,
+                )
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
+            if DEBUG_ASYNC_TRAINER_RUNTIME:
+                print(
+                    "[FSDPActorWorker][DebugRuntime] "
+                    f"rank={dist.get_rank() if dist.is_initialized() else -1} offloaded actor params to cpu",
+                    flush=True,
+                )
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+            if DEBUG_ASYNC_TRAINER_RUNTIME:
+                print(
+                    "[FSDPActorWorker][DebugRuntime] "
+                    f"rank={dist.get_rank() if dist.is_initialized() else -1} offloaded actor optimizer to cpu",
+                    flush=True,
+                )
 
         return output
 
@@ -1099,7 +1164,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         # perform recompute log_prob
-        calculate_entropy = not is_lora
+        calculate_entropy = (not is_lora) and data.meta_info.pop("calculate_entropy", True)
         with self.ulysses_sharding_manager:
             with adapter_ctx:
                 outputs = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
@@ -1615,8 +1680,12 @@ class CriticWorker(Worker, DistProfilerExtension):
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
             log_gpu_memory_usage("After offload critic optimizer during init", logger=logger)
 
+        critic_dp_group = self.ulysses_device_mesh["dp"].get_group() if self.ulysses_device_mesh is not None else dist.group.WORLD
         self.critic = DataParallelPPOCritic(
-            config=self.config, critic_module=self.critic_module, critic_optimizer=self.critic_optimizer
+            config=self.config,
+            critic_module=self.critic_module,
+            critic_optimizer=self.critic_optimizer,
+            dp_group=critic_dp_group,
         )
 
         self.flops_counter = FlopsCounter(self.critic_model_config)
