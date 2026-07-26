@@ -1067,8 +1067,8 @@ A: 都不是——它实际上是**trim 格式信号**。`content_early_stopped=
 
 ### 8.2 修订版简历 Bullet
 
-- Trained a 4B-param LLM agent with C-GRPO (async RL, 23 steps) for multi-hop web search; achieved **+80% relative accuracy** on DeepDive (18→32%) and **+119%** on BrowseComp (1.6→3.5%), with all 12 tracked metrics improving consistently across both benchmarks
-- Improved finished-to-correct conversion from 67% to 88% through RL-learned search termination; net gain of +21 samples across paired evaluation (33 gains vs 12 regressions)
+- Trained a 4B-parameter browser-tool agent with C-GRPO and asynchronous reinforcement learning for multi-hop web search; under a matched sampled evaluation, improved raw-judge DeepDive accuracy from `20/111` to `36/111` (`+14.4` percentage points), with a positive external signal on `BrowseComp subset256 64k` (`4/256` to `9/256`)
+- Built paired trajectory and failure-mode diagnostics that identified `24` SFT-wrong to RL-correct gains versus `8` regressions on DeepDive, while separating response-limit, budget, trim-label, and judge-consistency effects instead of attributing all gains to a single stopping behavior
 
 ---
 
@@ -1080,11 +1080,9 @@ A: 都不是——它实际上是**trim 格式信号**。`content_early_stopped=
 
 | Claim | Data | 为什么 safe |
 |-------|------|-----------|
-| +80% relative accuracy on DeepDive | 18.0%→32.4% | 绝对数字清晰，paired eval，方向无歧义 |
-| +119% relative accuracy on BrowseComp | 1.6%→3.5% | 方向一致，标注了绝对值所以读者知道基数低 |
-| 12/12 metrics consistent across benchmarks | 全部 ↑/↓ 方向一致 | 最强 robustness 证据，无 caveat |
-| Finished-to-correct conversion 67%→88% | dd111 数据 | 清晰、单一数据集、样本量合理 (30→41) |
-| Net gain +21 (33 gains vs 12 regressions) | paired 统计 | 不隐藏 regression，诚实数字 |
+| DeepDive raw-judge accuracy 增加 14.4 个百分点 | `20/111` → `36/111` | 绝对数字和分母清晰；若面试追问 judge 一致性，再补充 §2.5 的人工审计 |
+| BrowseComp subset256 64k 出现外部正向信号 | `4/256` → `9/256` | 可以作 supporting evidence，但必须带 `subset256 64k` 范围和低基数 caveat |
+| DeepDive paired net gain `+16` | `24` gains vs `8` regressions | 不隐藏 regression，且与正确数 `20 → 36` 完全一致 |
 | Async RL infrastructure (4-step param sync) | 工程事实 | 不依赖评测结论 |
 | C-GRPO with rubric + outcome reward | 算法事实 | 不依赖评测结论 |
 
@@ -1092,11 +1090,12 @@ A: 都不是——它实际上是**trim 格式信号**。`content_early_stopped=
 
 | Claim | Data | 为什么不写简历 |
 |-------|------|--------------|
-| "60% retention of baseline correct set" | dd111 11/(10+11) | 60% 不够高到无条件说 additive；面试追问"那 40% 呢"需要 context |
+| "60% retention of baseline correct set" | dd111 `12/20` | 60% 不够高到无条件说 additive；面试追问“那 40% 呢”需要 context |
 | "Oracle union accuracy 40%" | dd111 44/111 | 需要解释 oracle selector 概念，简历上太 niche |
 | BrowseComp 的绝对正确数 (4→9) | bc256 | 绝对数太小，写出来反而暴露基数问题 |
 | BrowseComp retention = 0% | bc256 0/4 | 极小样本主导，脱离 context 会被误读为"RL 没用" |
 | "RL 学会了更好的搜索策略" | case studies | 定性结论，面试可以举例支撑，但简历上不够 precise |
+| Finished-to-correct conversion 67%→88% | dd111 原始标签 | finished 分母受 trim false-positive 和标签语义影响，适合作为诊断而不是 headline |
 | content_early_stopped 与 outcome 的相关性 | 统计 | 不是因果关系，写简历容易过度声称 |
 | Thinking-only failure mode | 2-5 samples | 有价值的工程发现，但太细节不适合简历 |
 | "Tool calls 减少 33%" | top 5 gain 的均值 | Cherry-picked subset，面试讲单个 case OK，简历上不 defensible |

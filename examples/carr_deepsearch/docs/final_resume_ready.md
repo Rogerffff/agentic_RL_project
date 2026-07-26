@@ -1,12 +1,14 @@
 # CaRR DeepSearch — Final Resume-Ready Document (v2, 2026-04-15)
 
+> 2026-07-26 口径修正：本文件是候选对外文案，所有数字仍以 `resume_source_of_truth_20260412.md` 为准。异步吞吐只可表述为健康窗口下约 `37%-45%` 的迭代时间缩短，因为同步与异步的 batch、rollout 数量和 budget 不完全相同；不得写成严格同配置加速。同步后期是单个 step 的 timeout 峰值达到 `90.6%`，异步稳定窗口将 rollout timeout 压到接近 0，但不能概括成全程“彻底消除所有 timeout”。
+
 ## 项目标题
 
 基于 verl 框架的 Deep Search Agent 强化学习训练系统 —— 集成 CaRR Citation-Aware Rubric Reward 与异步训练架构
 
 ## 一句话摘要
 
-在 verl 开源 RL 框架上集成 CaRR 论文的 citation-aware rubric reward 与 C-GRPO 算法，训练 Qwen3-4B 模型通过多轮浏览器工具调用（search/open/find）进行深度搜索问答；扩展并稳定化 verl 的异步训练架构，将 rollout 与参数更新解耦，在 8 GPU 上实现约 45% 的训练迭代加速；在内部验证集和外部 BrowseComp 评测上均观测到正向 RL 训练信号。
+在 verl 开源 RL 框架上集成 CaRR 论文的 citation-aware rubric reward 与 C-GRPO 算法，训练 Qwen3-4B 模型通过多轮浏览器工具调用（search/open/find）进行深度搜索问答；扩展并稳定化 verl 的异步训练架构，将 rollout 与参数更新解耦，在 8 GPU 的健康窗口中实现约 37%-45% 的训练迭代时间缩短；在内部验证集和外部 BrowseComp 子集评测上均观测到正向 RL 训练信号。
 
 ---
 
@@ -20,7 +22,7 @@
 
 **A1（技术细节版）**
 
-扩展并稳定化 verl 的 fully_async_policy 以支持 64k 长上下文 agentic RL（~450 行框架层改造）：实现跨参数版本的 partial rollout cancel/resume、cancel-based queue drain 反压机制、no-flush 权重同步与 fingerprint 校验、以及 FSDP 动态 batch 的跨 DP rank 对齐。将 rollout 与参数更新解耦后，在 8×96GB GPU 上每步训练迭代时间从约 500s 降至约 280s，同时消除了同步训练后期超过 90% 样本因长尾 rollout 阻塞而超时的问题。
+扩展并稳定化 verl 的 fully_async_policy 以支持 64k 长上下文 agentic RL（~450 行框架层改造）：实现跨参数版本的 partial rollout cancel/resume、cancel-based queue drain 反压机制、no-flush 权重同步与 fingerprint 校验、以及 FSDP 动态 batch 的跨 DP rank 对齐。将 rollout 与参数更新解耦后，在 8×96GB GPU 的健康窗口中把每步等价训练时间从同步后段约 506s 降至约 280-320s，并把同步后期一度达到 90.6% 的 rollout-timeout 峰值在异步稳定窗口压到接近 0；两阶段配置不同，因此该数字是系统工程对比而非严格消融。
 
 - Impact: 4 / Defensibility: 5 / Risk: 1
 - 优点：机制具体、数字真实、因果链清晰
@@ -28,15 +30,15 @@
 
 **A2（问题导向版）**
 
-针对多轮 agentic RL 中 rollout 时间差异极大（十几秒到数百秒）的核心瓶颈，改造 verl 的异步训练架构（~450 行）：将 rollout 与参数更新解耦，实现 partial rollout 跨参数版本恢复、queue backpressure 与 KV cache 一致性管理等机制，使训练迭代时间缩短约 45%（500s→280s），并将同步训练后期因长尾阻塞导致的超时截断从 90%+ 降至 0%。
+针对多轮 agentic RL 中 rollout 时间差异极大（十几秒到数百秒）的核心瓶颈，改造 verl 的异步训练架构（~450 行）：将 rollout 与参数更新解耦，实现 partial rollout 跨参数版本恢复、queue backpressure 与 KV cache 一致性管理等机制，使健康窗口的等价训练迭代时间缩短约 37%-45%（约 506s→280-320s），并将 rollout-timeout 从同步后期单步 90.6% 的峰值压到异步稳定窗口接近 0。
 
 - Impact: 5 / Defensibility: 4 / Risk: 1
-- 优点：先讲问题再讲方案，更有叙事感；"90%+ 降至 0%"非常有力
-- 缺点：面试官可能追问"90%+ 怎么来的"（需要解释是同步后期的恶化，不是常态）
+- 优点：先讲问题再讲方案，更有叙事感；“单步峰值 90.6% 降到稳定窗口接近 0”有明确日志依据
+- 缺点：必须主动说明这是峰值与健康窗口的对比，而且两阶段配置不同
 
 **A3（精简版，适合版面紧张）**
 
-扩展 verl 的异步训练架构支持 64k 长上下文 agentic RL：将 rollout 与参数更新解耦，实现 partial rollout cancel/resume 与 queue backpressure 等机制，在 8 GPU 上将每步训练迭代从约 500s 降至 280s，同时消除了同步训练后期的 rollout 超时瓶颈。
+扩展 verl 的异步训练架构支持 64k 长上下文 agentic RL：将 rollout 与参数更新解耦，实现 partial rollout cancel/resume 与 queue backpressure 等机制，在 8 GPU 的健康窗口中将每步等价训练时间从约 506s 降至 280-320s，并显著缓解同步训练后期的 rollout 超时瓶颈。
 
 - Impact: 3 / Defensibility: 5 / Risk: 0
 - 优点：简洁，主干信息完整
@@ -129,7 +131,7 @@
 
 **D1（failure mode 列举版）**
 
-在 SFT → 同步 RL → 异步 RL 的全流程中排查并解决 10+ 个跨层级 failure mode：SFT-RL 工具 schema JSON key 顺序不一致导致模型无法调用工具、同步后期 90%+ rollout 超时导致有效梯度信号归零、FSDP 动态 batch 跨 rank micro-batch 数不一致导致 allreduce hang、SGLang 在线权重更新的 KV cache 破坏等，每个问题均需跨 agent loop / reward server / SGLang / FSDP 多层级联合排查。
+在 SFT → 同步 RL → 异步 RL 的全流程中排查并解决 10+ 个跨层级 failure mode：SFT-RL 工具 schema JSON key 顺序不一致导致模型无法调用工具、同步训练后期单步 90.6% rollout timeout 导致有效梯度信号退化、FSDP 动态 batch 跨 rank micro-batch 数不一致导致 allreduce hang、SGLang 在线权重更新的 KV cache 破坏等，每个问题均需跨 agent loop / reward server / SGLang / FSDP 多层级联合排查。
 
 - Impact: 4 / Defensibility: 5 / Risk: 1
 - 优点：具体 failure mode 非常有说服力，展示跨层排查能力
@@ -148,7 +150,7 @@
 
 ### Bullet 1 — 异步训练架构（A2 变体）
 
-针对多轮 agentic RL 中 rollout 时间差异极大（十几秒到数百秒）导致同步训练后期超过 90% 样本超时截断的问题，扩展 verl 的异步训练架构（~450 行框架层改造）：将 rollout 与参数更新解耦，实现 partial rollout 跨参数版本恢复、cancel-based queue drain 反压、no-flush 权重同步与 fingerprint 校验、以及 FSDP 动态 batch 的跨 DP rank 对齐，在 8×96GB GPU 上将训练迭代时间从约 500s 降至约 280s，同时完全消除了 rollout 超时截断。
+针对多轮 agentic RL 中 rollout 时间差异极大（十几秒到数百秒）、同步训练后期单步 rollout-timeout 峰值达到 90.6% 的问题，扩展 verl 的异步训练架构（~450 行框架层改造）：将 rollout 与参数更新解耦，实现 partial rollout 跨参数版本恢复、cancel-based queue drain 反压、no-flush 权重同步与 fingerprint 校验、以及 FSDP 动态 batch 的跨 DP rank 对齐，在 8×96GB GPU 的健康窗口中将每步等价训练时间从约 506s 降至 280-320s，并将 rollout-timeout 压到接近 0。
 
 ### Bullet 2 — 方法实现（B2）
 
@@ -198,10 +200,10 @@
 
 | 指标 | 数值 | 说明 |
 |------|------|------|
-| 训练迭代加速 | ~500s → ~280s（约 45%） | 同步后段 vs 异步健康窗口 |
+| 健康窗口迭代时间 | ~506s → ~280-320s（缩短约 37%-45%） | 同步后段 vs 异步健康窗口；配置不同，非严格消融 |
 | Rollout-Training 解耦 | rollout 预算 360s → 480s | 异步允许更充分搜索而不阻塞训练 |
 | 参数同步优化 | 323s → 1.7-20s | cancel-based drain + fingerprint 校验 |
-| Timeout 消除 | 90%+ → 0% | gmu=0.5 + async 解耦 |
+| Rollout-timeout 压力 | 同步后期单步峰值 90.6% → 异步稳定窗口接近 0 | gmu=0.5 + async 解耦；非全程均值 |
 | 训练动态 | 工具调用 ~35 → ~48（+37%） | 模型学到更深搜索策略 |
 | 代码贡献 | agent loop 1050 行 + async 451 行 + C-GRPO 120 行 | 扩展 verl 框架 |
 | 训练规模 | ~5,400 trajectories（论文的 ~10%） | 系统验证为主 |
@@ -212,13 +214,13 @@
 
 ### 30 秒版
 
-"这个项目是在 verl 框架上集成 CaRR 论文的 deep search agent RL 训练流水线。我的核心贡献是三个层面：一是 450 行的框架层改造让异步训练在 64k 长轨迹下能稳定运行，迭代速度提升约 45%，消除了同步训练后期 90% 以上的超时截断；二是把论文的 rubric reward 和 C-GRPO 算法完整接入 verl 的训练循环（约 1200 行）；三是在内部和外部评测上都验证了 RL 训练的正向效果——内部验证集 outcome 从 0.18 提升到 0.32。"
+"这个项目是在 verl 框架上集成 CaRR 论文的 deep search agent RL 训练流水线。我的核心贡献是三个层面：一是 450 行的框架层改造让异步训练在 64k 长轨迹下能稳定运行，健康窗口的等价迭代时间缩短约 37%-45%，并把同步后期单步 90.6% 的 rollout-timeout 峰值压到接近 0；二是把论文的 rubric reward 和 C-GRPO 算法完整接入 verl 的训练循环（约 1200 行）；三是在内部和外部评测上都验证了 RL 训练的正向效果——内部验证集 outcome 从 0.18 提升到 0.32。"
 
 ### 2 分钟版
 
 在 30 秒版基础上展开：
 
-"异步改造解决的核心问题是：多轮工具调用的 rollout 时间差异极大，从十几秒到几百秒。同步架构下最慢的 rollout 阻塞所有 GPU，到训练后期超过 90% 的样本因为来不及完成就被截断，reward 全是 0，GRPO 的组内对比退化成纯噪声。我把 rollout 和训练解耦后，快的样本不用等慢的，同时慢的样本有更充分的搜索时间。具体要解决的工程问题包括：跨参数版本的 partial rollout 恢复、queue 满了怎么做 backpressure、权重同步时的 KV cache 处理、FSDP 动态 batch 在不同 rank 间的对齐。"
+"异步改造解决的核心问题是：多轮工具调用的 rollout 时间差异极大，从十几秒到几百秒。同步架构下最慢的 rollout 会阻塞所有 GPU，训练后期曾有一个 step 的 rollout-timeout 达到 90.6%，使该批次的大量 reward 变成 0，GRPO 的组内对比信号严重退化。我把 rollout 和训练解耦后，快的样本不用等慢的，同时慢的样本有更充分的搜索时间。具体要解决的工程问题包括：跨参数版本的 partial rollout 恢复、queue 满了怎么做 backpressure、权重同步时的 KV cache 处理、FSDP 动态 batch 在不同 rank 间的对齐。"
 
 "CaRR 的核心思路是不只看最终答案对不对，还会把多跳问题分解成 rubric——一组可验证的单跳事实约束——然后用 LLM Judge 逐条检查 agent 的搜索轨迹是否覆盖了这些约束。C-GRPO 的关键设计是只对答案正确的轨迹注入这个过程质量信号，避免错误轨迹因碰巧命中局部事实就获得正向梯度。"
 
@@ -240,7 +242,7 @@
 
 **Q: 训练收敛了吗？训练量够吗？**
 
-"训练量是论文的约 10%，约 5,400 条轨迹。同步阶段在中期窗口展示了正向信号，但后期因为长尾 rollout 阻塞导致 90%+ 超时截断，有效梯度信号崩塌，这驱动了异步架构改造。异步阶段恢复了 n=8 的 rollout group size、消除了 timeout，在稳定配置下训练了 23 轮参数同步。最终评测在内外部都给出正向结果。训练量不到论文的完整规模，但已经验证了系统的正确性和方法的有效性。"
+"训练量是论文的约 10%，约 5,400 条轨迹。同步阶段在中期窗口展示了正向信号，但后期因长尾 rollout 阻塞出现单步 90.6% 的 timeout 峰值，有效梯度信号明显退化，这驱动了异步架构改造。异步阶段恢复了 n=8 的 rollout group size，并在稳定窗口把 rollout timeout 压到接近 0，完成了 23 轮参数同步。最终评测在内外部都给出正向结果。训练量不到论文的完整规模，但已经验证了系统的正确性和方法的有效性。"
 
 **Q: 异步 partial rollout 实际生效了吗？**
 
@@ -292,9 +294,9 @@ timeout 的样本不是被丢弃，而是**作为 reward=0 参与 GRPO 组内归
 5. param sync 只做 version bump 不同步实际权重 → 实现真实权重同步 + fingerprint 校验
 6. queue_full 时 processor 死锁 → cancel-based partial drain
 7. FSDP dynbsz 跨 rank micro-batch 数不一致 → same_micro_num_in_dp 对齐
-8. 同步训练后期 90%+ rollout timeout → 驱动 async 架构改造
+8. 同步训练后期单步 rollout-timeout 峰值达到 90.6% → 驱动 async 架构改造
 9. SGLang flush_cache 偶发空响应 → 强校验 + 自动 resume
-10. gmu=0.3 下 SGLang KV cache 不足导致长序列 timeout → 调到 gmu=0.5 彻底消除
+10. gmu=0.3 下 SGLang KV cache 不足导致长序列 timeout → 调到 gmu=0.5 后在稳定窗口不再复现该类 timeout
 11. max_tool_response_length 从 6000 改为 5000 导致主瓶颈从 response_limit 转移到 timeout → 配置回滚
 12. response_mask 不正确标记工具返回内容 → 只对模型生成 token 计算 loss
 

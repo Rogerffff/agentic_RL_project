@@ -1,4 +1,4 @@
-# CaRR DeepSearch Interview Q&A Bank (2026-04-12)
+# CaRR DeepSearch Interview Q&A Bank (2026-04-12, status updated 2026-07-26)
 
 ## 0. 使用说明
 
@@ -8,11 +8,12 @@
 - 回答形式：优先给出可以直接口述的短答，再给 1-3 个展开点
 - 引用规则：
   - `Observed`：已有代码、文档或本地日志支持
-  - `Estimated`：当前未做真实外部评测，使用内部 placeholder 或论文 prior，必须显式标注
-  - `Pending`：后续新 GPU 机恢复后补测
+  - `Estimated`：只用于尚未执行的 full/128K 可选扩展，不得对外当作实测结果
+  - `Pending`：可选的后续研究项，不等于当前项目尚未收尾
 - 对外使用规则：
-  - `DeepDive subset64` 和 async 训练日志可对外讲
-  - `BrowseComp` 外部 uplift 只能在标明 `Estimated` 的前提下内部准备，不能当成已验证结果
+  - `DeepDive rl_val 111` 和 `BrowseComp subset256 64k` 已完成 matched sampled eval，可以按精确范围引用真实结果
+  - 不得把 `BrowseComp subset256` 写成完整 BrowseComp，也不得把结果写成论文复现
+  - 文档后文若仍有评测前的 placeholder 或 Pending 表述，以本节和 `resume_source_of_truth_20260412.md` 的最新状态为准
 
 建议使用方式：
 
@@ -1159,52 +1160,52 @@ partial rollout 允许在参数同步时 cancel 正在生成的样本、同步�
 
 **短答**
 
-最重要的是：`BrowseComp` 外部 uplift 还没有真实补测，所以不能对外说“async_best 已经超过 SFT / step70 的 BrowseComp 实测结果”。
+当前不能 claim 的主要是完整 `BrowseComp`、128K 上下文结果、GRPO/C-GRPO 本地消融，以及“异步架构在完全相同配置下因果性提升了 37%-45%”。已经完成并可以准确引用的是 `DeepDive rl_val 111` 与 `BrowseComp subset256 64k` 的 matched sampled eval。
 
 **展开**
 
-- 现在只能用 `Estimated` placeholder 做内部准备
-- 面试里如果被问到，可以给出估计值，但必须说是 paper prior + 待复验
-- 绝对不能把 placeholder 当 observed
+- `BrowseComp subset256 64k` 是真实结果，但不是 full benchmark
+- 同步和异步阶段的 batch、rollout 数量与 budget 不完全相同，因此吞吐数字是系统工程对比，不是严格消融
+- 论文中的算法消融可以用于解释设计依据，不能说成我在本项目里重新做过
 
 **引用**
 
-- `examples/carr_deepsearch/docs/resume_source_of_truth_20260412.md:319-343`
-- `examples/carr_deepsearch/docs/post_gpu_revalidation_plan_20260412.md:142-239`
+- `examples/carr_deepsearch/docs/resume_source_of_truth_20260412.md`
+- `examples/carr_deepsearch/docs/eval_analysis_20260415.md`
 
-### Q66. 如果面试官追问“那你预计 BrowseComp 会是多少”，怎么回答？
+### Q66. 如果面试官追问“BrowseComp 具体测到了多少”，怎么回答？
 
 **短答**
 
-可以给一个显式标注为 `Estimated placeholder` 的内部预估：`BrowseComp subset256 64k` 上，`paper 4B-SFT prior=7.7`（Estimated placeholder, not local eval），由此推得 `estimated step70=9.3`、`estimated async_best=10.2`；`128k` placeholder 则是 `paper 4B-SFT prior=14.1`，对应 `estimated step70=15.0`、`estimated async_best=15.5`。
+真实测评是 `BrowseComp subset256 64k`：在完全一致的 sampled eval 配置和 relaxed-but-bounded budget 下，SFT 的 judge-pass 为 `4/256`，async23 为 `9/256`；记录到的完成回答数从 `11` 增加到 `17`。这是方向一致的外部正向证据，但正样本绝对数量较少，不能包装成完整 benchmark 的稳定大幅提升。
 
 **展开**
 
-- 必须加一句：这些数是论文 prior 驱动的内部占位，不是这个项目已经测出来的真实值
-- 当前 `subset256` 和 `full` 都只是借用了论文 full benchmark prior，不是本地 `subset256` 实测
-- 真实口径要等新 GPU 上机后按 sampled recipe 重测
+- 评测使用 `temperature=0.6`、`top_p=0.95`、`top_k=20`、`do_sample=true` 和 64K response limit
+- SFT 与 async23 使用同一评测数据、解码参数和 budget，因此两者可直接比较
+- 不能把 `4/256 -> 9/256` 说成完整 BrowseComp，也不应只强调 125% 相对增幅而隐藏低基数
 
 **引用**
 
-- `examples/carr_deepsearch/docs/resume_source_of_truth_20260412.md:330-337`
-- `examples/carr_deepsearch/docs/post_gpu_revalidation_plan_20260412.md:142-190`
+- `examples/carr_deepsearch/docs/eval_analysis_20260415.md`
+- `examples/carr_deepsearch/docs/resume_source_of_truth_20260412.md`
 
-### Q67. 如果面试官说“没有外部 benchmark 你怎么证明项目有效”，怎么答？
+### Q67. 如果面试官说“外部 benchmark 正样本太少，怎么证明项目有效”，怎么答？
 
 **短答**
 
-我会区分“系统有效”和“外部 benchmark uplift 已验证”两件事。当前已经被证明的是系统有效：奖励接通、async 跑稳、resume 可用、gate 能选点、内部训练窗口有显著改善；外部 benchmark uplift 还在待复验状态，我不会把两者混为一谈。
+我会把系统证据、内部质量证据和外部泛化证据分开讲。系统侧已经证明 async 主线可训练、可恢复、可评测；内部 `DeepDive 111` 的正确数从 `20/111` 提升到 `36/111`；外部 `BrowseComp subset256 64k` 的 judge-pass 从 `4/256` 提升到 `9/256`。外部正样本仍少，所以它是 supporting evidence，而不是 SOTA 或完整论文复现结论。
 
 **展开**
 
-- 这是成熟的实验口径，不是回避问题
-- 内部可信评测先成立，外部结果再补
-- 真实工程里很多项目都是这样推进的
+- 不把小样本外部结果单独当成充分证明，而是看系统、内部评测和外部方向是否形成一致证据链
+- `DeepDive 111` 的绝对增益更适合做质量 headline，BrowseComp 子集只做外部 supporting evidence
+- 若继续投入 GPU，最有价值的是补 full benchmark 降低方差，而不是重复当前子集
 
 **引用**
 
-- `examples/carr_deepsearch/docs/resume_source_of_truth_20260412.md:347-366`
-- `examples/carr_deepsearch/docs/post_gpu_revalidation_plan_20260412.md:224-239`
+- `examples/carr_deepsearch/docs/resume_source_of_truth_20260412.md`
+- `examples/carr_deepsearch/docs/eval_analysis_20260415.md`
 
 ### Q68. 如果面试官问“best checkpoint 是哪个”，怎么答最稳妥？
 
@@ -1245,43 +1246,40 @@ partial rollout 允许在参数同步时 cancel 正在生成的样本、同步�
 
 **短答**
 
-最大的未完成项是对最终 async 候选做真实的 `BrowseComp` 外部 sampled eval，并按统一 recipe 回填文档，把 `Estimated` 升成 `Observed`。
+当前简历闭环没有必须补做的训练或评测。若把项目继续扩展成更完整的研究复现，优先级最高的可选项是 `BrowseComp full 64k`，其次是 128K 上下文评测和本地 GRPO/C-GRPO 消融。
 
 **引用**
 
-- `examples/carr_deepsearch/docs/post_gpu_revalidation_plan_20260412.md:98-190`
-- `examples/carr_deepsearch/docs/resume_source_of_truth_20260412.md:89-90`
+- `examples/carr_deepsearch/docs/eval_analysis_20260415.md`
+- `examples/carr_deepsearch/docs/resume_source_of_truth_20260412.md`
 
 ### Q71. 如果你现在拿到新 GPU，第一优先级会做什么？
 
 **短答**
 
-先做 preflight 和 checkpoint merge，然后按固定 sampled recipe 跑 `DeepDive subset64` 内部 gate，再跑 `BrowseComp subset256 64k` 的外部 gate，而不是直接继续训练。
+如果目标仍是提高证据强度，我会先确认现有 SFT 和 async23 checkpoint 可用，然后在相同 sampled recipe 下补 `BrowseComp full 64k` 的成对评测；只有结果仍为正且预算充足时，再考虑 128K 评测。已经完成的 `DeepDive 111` 和 `BrowseComp subset256 64k` 不需要为了简历闭环机械重跑。
 
 **展开**
 
-- 先按 runbook 做一轮最小 preflight：tool server health check -> reward server health check -> `smoke_test.py --all` -> checkpoint merge -> `DeepDive subset64` gate -> `BrowseComp subset256 64k` gate
+- 仍要按 runbook 做最小 preflight：tool server health check -> reward server health check -> `smoke_test.py --all` -> checkpoint 检查
 - 先确认环境、密钥、SGLang / CUDA / Ray / flashinfer 正常
 - 评测前所有 checkpoint 必须先 merge 成 `huggingface_merged`
-- `BrowseComp` 不能直接拿 `run_eval_browsecomp.sh` 当正式 gate，因为那个脚本固定 greedy；正式外部 gate 要走 `run_eval_integration.sh` 或 sampled wrapper
-- 外部 gate 只有在内部 gate 选出 `async_best` 后才开始
+- `BrowseComp` 不能直接拿 `run_eval_browsecomp.sh` 当正式结果，因为那个脚本固定 greedy；正式评测要走 `run_eval_integration.sh` 或 sampled wrapper
+- SFT 与 async23 必须使用同一 full 数据集、解码参数、response limit 和 budget
 
 **引用**
 
-- `examples/carr_deepsearch/docs/post_gpu_revalidation_plan_20260412.md:3-40`
-- `examples/carr_deepsearch/docs/post_gpu_revalidation_plan_20260412.md:44-95`
-- `examples/carr_deepsearch/docs/post_gpu_revalidation_plan_20260412.md:98-190`
+- `examples/carr_deepsearch/docs/eval_analysis_20260415.md`
+- `examples/carr_deepsearch/docs/post_gpu_revalidation_plan_20260412.md`
 - `examples/carr_deepsearch/scripts/smoke_test.py:15-25`
-- `examples/carr_deepsearch/scripts/smoke_test.py:33-100`
-- `examples/carr_deepsearch/scripts/smoke_test.py:103-147`
 
 ### Q72. 如果再给你一周，你最想补哪三个方向？
 
 **短答**
 
-1. 补完 `BrowseComp subset256/full` 的 sampled eval  
+1. 补 `BrowseComp full 64k` 的 matched sampled eval，降低当前 subset256 的方差
 2. 继续压 `update_actor` 和 `param_sync` 尾部  
-3. 研究更稳的 `128k` 配置和 continuation 边界
+3. 在预算允许时补 GRPO/C-GRPO 消融或研究更稳的 `128k` 配置
 
 **展开**
 
@@ -1316,7 +1314,7 @@ partial rollout 允许在参数同步时 cancel 正在生成的样本、同步�
 
 **短答**
 
-最大的残留系统风险是：`param_sync` 仍有长尾，trainer `update_actor` 仍是主瓶颈，而且外部 benchmark 还没在新机器上完成统一口径复验。
+最大的残留系统风险是：`param_sync` 仍有长尾，trainer `update_actor` 仍是主瓶颈，而且当前 external evidence 只覆盖 `BrowseComp subset256 64k`，正样本数量较少。
 
 **引用**
 
@@ -1350,7 +1348,7 @@ partial rollout 允许在参数同步时 cancel 正在生成的样本、同步�
 
 - `128k` 不是简单把 `max_response_length` 翻倍
 - rollout、trainer、eval 三条链都会一起变贵
-- 所以后续计划里只在 `BrowseComp subset256 64k` 为正后，才条件性加测 `128k`
+- 当前 `BrowseComp subset256 64k` 已经给出正向结果；若继续投入，应先用 full 64k 确认低方差趋势，再决定是否加测 `128k`
 
 **引用**
 
@@ -1430,7 +1428,7 @@ partial rollout 允许在参数同步时 cancel 正在生成的样本、同步�
 
 - 我不是把 CaRR 当成“论文里的 reward 名词”来讲，而是把它拆成了 `outcome reward`、citation-grounded `rubric reward`、evidence chain、组内归一化和“只奖励正确 rollout”这几个可实现的设计点。
 - 我不会把 async 主线讲成“速度一定更快”，而是讲成“通过可解释的失败模式定位，把系统从 timeout / OOM / stall 推到可训练、可恢复、可评测，再在健康窗口里看到吞吐改善”。
-- 我不会把 `BrowseComp` placeholder 伪装成真实结果；如果面试官问，我会明确说哪些是 `Observed`，哪些只是 `Estimated` 的内部准备数字。
+- 我会明确说外部实测范围是 `BrowseComp subset256 64k`，并同时报告 `4/256 -> 9/256` 的分子和分母，不把低基数相对提升包装成完整 benchmark 结论。
 
 **引用**
 
@@ -2063,7 +2061,7 @@ parquet 层面最核心的列是：`data_source`、`agent_name`、`prompt`、`ab
 
 - continuation 前必须先排除：`BrowseComp` 结果只是因为 greedy 脚本、merge 资产不对、或 infra 回退而变差
 - 只有当 `async_best` 内部不差于 `step70`、外部至少不差于 `SFT/step70`、主坏因是 `response_limit / unfinished` 时，才值得补 `+4` 到 `+8` 个 async step
-- 这也是为什么文档里明确写了：continuation 是条件动作，不是默认动作
+- 最终 matched eval 已经形成简历闭环，因此本项目没有为了增加内部 step 数而机械执行 continuation
 
 **引用**
 
@@ -2099,7 +2097,7 @@ parquet 层面最核心的列是：`data_source`、`agent_name`、`prompt`、`ab
 **展开**
 
 - 在 async 主线还会 timeout / OOM / stall 的阶段，做算法 sweep 很容易把 infra 噪声误当成方法差异
-- 当前最缺的不是再多一个局部表格，而是先把 `BrowseComp` 的真实 sampled eval 补齐
+- 当前真实 sampled eval 已经补齐最小闭环；若继续做研究，下一步才是 full benchmark 或 controlled algorithm ablation
 - 对未做的算法消融，可以直接引用论文结论，但要明确说“这是 paper prior，不是本地复验”
 
 **引用**
@@ -2131,19 +2129,18 @@ parquet 层面最核心的列是：`data_source`、`agent_name`、`prompt`、`ab
 
 **短答**
 
-因为当前最强、最干净的 `Observed` 证据是系统工程结果：reward 接通、async 主线稳定、checkpoint 可 resume、eval 口径固定、内部 gate 可解释。外部 `BrowseComp` uplift 还在 `Estimated/Pending` 阶段，所以不能把它写成已验证 headline。
+因为最有区分度、也最容易被代码和日志完整证明的贡献仍然是 CaRR 接入、async partial rollout、参数同步、backpressure、恢复和诊断体系。外部 `BrowseComp subset256 64k` 已经有真实正向结果，但只有 `4` 和 `9` 个 judge-pass 样本，适合作为 supporting evidence，不适合脱离范围和基数写成夸张 headline。
 
 **展开**
 
 - 这是 claim discipline，不是回避结果
-- 你现在能稳讲的是：`global_step_23` durable、`step16` 最佳内部窗口、`step70` 按 gate 被选作 async 起点、`param_sync` 已显著收敛但仍有 tails
-- 真实外部 uplift 要等 sampled `BrowseComp` 补测后再升级成 headline
+- 你现在能稳讲的是：系统可恢复、健康窗口吞吐缩短、`DeepDive 111` 从 `20/111` 到 `36/111`，以及 `BrowseComp subset256 64k` 从 `4/256` 到 `9/256`
+- 外部 full benchmark、128K 和严格算法消融仍未执行，所以不越过证据边界
 
 **引用**
 
-- `examples/carr_deepsearch/docs/resume_source_of_truth_20260412.md:78-90`
-- `examples/carr_deepsearch/docs/resume_source_of_truth_20260412.md:317-343`
-- `examples/carr_deepsearch/docs/resume_source_of_truth_20260412.md:347-366`
+- `examples/carr_deepsearch/docs/resume_source_of_truth_20260412.md`
+- `examples/carr_deepsearch/docs/eval_analysis_20260415.md`
 
 ### Q127. 如果现在要补一个“最小可辩护”的算法消融矩阵，你会怎么设计？
 

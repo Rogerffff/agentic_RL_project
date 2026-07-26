@@ -3,6 +3,7 @@
 > 分析日期: 2026-04-15
 > 模型对比: SFT baseline vs async23 (23-step async RL)
 > 评测集: DeepDive rl_val (111 samples) + BrowseComp subset (256 samples)
+> 2026-07-26 口径修正: 本文的原始统计表仍保留，但结论必须结合 `eval_result_deep_analysis_followup.md` 和 `agent_loop_run_explained.md` 使用。跨数据集同方向是描述性现象，不等于统计鲁棒性；finished/early-stop 指标受 trim 标签语义和少量 false-positive 影响。
 
 ---
 
@@ -10,19 +11,19 @@
 
 ### 核心结论
 
-1. **RL 训练显著提升了 accuracy**: dd111 outcome 18.0%→32.4% (+80% 相对提升), bc256 1.6%→3.5% (+119%)
-2. **Net gain 为正**: 33 gain samples vs 12 regression samples, net +21
-3. **所有 12 项指标在两个评测集上方向完全一致** (Task 3.11), 结论 robust
-4. **核心机制**: RL 模型 (a) 提升了任务完成率 (finished ratio ↑9.9%/+2.3%, response_limit 截断 ↓13.5%/↓3.1%)；(b) 输出更稳定地命中可被 trim 识别的最终答案格式 (early_stop ratio ↑7.2%/+2.7%——**注意这是 trim 格式信号而非"主动早停"**，详见 followup §7)
-5. **Finished-to-correct conversion rate 大幅提升**: dd111 66.7%→87.8%, bc256 36.4%→52.9%
+1. **raw judge accuracy 上升**: dd111 从 `20/111` 提升到 `36/111`（+14.4 个百分点）；bc256 从 `4/256` 提升到 `9/256`，但外部正样本绝对数量较少
+2. **paired net gain 为正**: dd111 为 `24` gains、`8` regressions，net `+16`；bc256 为 `9` gains、`4` regressions，net `+5`
+3. **12 个描述性指标的方向在两个评测集上相同** (Task 3.11)，但没有重复采样置信区间，而且 BrowseComp 正样本很少，因此不能称为无 caveat 的 robustness 证明
+4. **相关行为变化**: 记录到的 finished ratio 上升、response-limit 截断下降，输出也更常命中 trim 可识别格式；这些变化与 outcome 上升相关，但不能仅凭本次数据断言单一因果机制
+5. **原始标签下的 finished-to-correct conversion 上升**: dd111 66.7%→87.8%, bc256 36.4%→52.9%；该分母受 trim false-positive 和 finished 标签语义影响，只适合作为诊断指标
 6. **`content_early_stopped` 与高 outcome 相关，但本质是 trim 格式信号**: early_stopped 样本 outcome mean 高 (dd111: 0.83 vs 整体 0.32)。但**`content_early_stopped` 的真实判定是输出是否命中 trim 可识别的完整答案格式**（`## Exact Answer` + `## References` + 可裁剪引用段），代码中没有任何"主动停止"的硬路径，也没有消费 rollout 的 `stop_reason`。详见 followup §7
 
 > **⚠️ 命名陷阱说明**：本主分析早期把 `early_stop` 解读为"主动早停能力"是错误的。后续 followup 文档 §7 已详细修正：`early_stop` 的真实语义是"输出命中 trim 格式"，`natural` 是 `finished but trim-miss` 的残差 bucket。下文仍保留 `early_stop` / `natural` 这两个术语（代码字段名一致），但解读时应按修正后的语义理解。
 
 ### 简历 Bullet Points
 
-- Trained a 4B-param LLM agent with C-GRPO (async RL, 23 steps) to perform multi-hop web search; achieved **+80% relative accuracy gain** on DeepDive (18%→32%) and **+119%** on BrowseComp (1.6%→3.5%), with consistent improvement across all 12 tracked metrics on both benchmarks
-- Improved finished-to-correct conversion from 67% to 88% on DeepDive through RL training, raising both task completion rate and answer quality across paired evaluation
+- Trained a 4B-parameter browser-tool agent with C-GRPO and asynchronous reinforcement learning for multi-hop web search; under a matched sampled evaluation, improved raw-judge DeepDive accuracy from `20/111` to `36/111` (`+14.4` percentage points), with a positive external signal on `BrowseComp subset256 64k` (`4/256` to `9/256`)
+- Built paired trajectory and failure-mode diagnostics that identified `24` gains versus `8` regressions on DeepDive while separating response-limit, budget, trim-label, parse-event, and judge-consistency effects
 
 ---
 
@@ -444,6 +445,8 @@ SFT n=4, RL n=9
 - BrowseComp outcome=1 样本极少（SFT 4个、RL 9个），统计波动大
 - 两个数据集的问题类型和搜索深度需求不同
 
+这张表只说明所选聚合均值在本次单次 sampled eval 中方向相同。它没有提供 seed-level 重复实验、置信区间或显著性检验；其中 `early_stop` 与 `parse_error_count` 还有特殊实现语义。因此不能把“12/12 同方向”单独写成强鲁棒性或因果性结论。
+
 ---
 
 ### Task 3.0 面试展开版
@@ -768,7 +771,7 @@ Top 5 案例展示了一个清晰的共性模式：
 
 **Q: RL 训练有没有 regression？如何看待？**
 
-A: 有。33 个增益 vs 12 个回退，net gain +21。Regression 主要有两类原因：(1) 搜索策略变化导致少数样本搜得更多但方向偏了 (9/12)；(2) 少数样本过早 early_stop (3/12)。这是 RL 训练 exploration-exploitation tradeoff 的正常表现——模型整体学会了更高效的搜索，但在个别样本上会因策略变化而 regress。重要的是：(a) net gain 显著为正；(b) 方向在两个独立评测集上完全一致；(c) regression 的主因是可识别和可改进的。
+A: 有。应分数据集报告：dd111 是 24 个增益、8 个回退，net gain +16；bc256 是 9 个增益、4 个回退，net gain +5，但后者基数很小。回退样本中可以识别出新的 budget/response-limit 截断、thinking 循环和 finished-but-wrong 等类型。这个结果说明收益不是无代价的，也不能把所有回退归因于单一的 exploration tradeoff；更稳妥的结论是 net gain 为正，同时失败类型可追溯。
 
 ---
 
@@ -966,4 +969,4 @@ Rubric reward 只有 outcome=1 的样本才非零（100% 对应关系）。RL �
 
 ### Task 3.11 面试展开版
 
-**所有 12 项指标在 dd111 和 bc256 上方向完全一致**——这是很强的 robustness 证据。两个数据集难度差异巨大（dd111 unfinished 63% vs bc256 93%），但 RL 训练的主效应方向一致：accuracy ↑, unfinished ↓, early_stop ↑, response_length ↓, tool_calls ↓, rollout_time ↓。`parse_error_count` 的方向也一致，但由于它混合了真实坏 JSON 与 response-limit 尾部截断，不应当被当作和 accuracy 同等级的核心证据。更稳的结论是：RL 学到的搜索策略提升在两个数据集上都表现为更容易完成、更少撞上 token limit，而不是依赖某个单独的格式性指标。
+本次单次 sampled eval 中，所选 12 个聚合指标在 dd111 和 bc256 上方向相同。这个现象可以作为内部与外部结果方向一致的辅助证据，但不是强 robustness 证明：没有多 seed 置信区间，bc256 只有 4 和 9 个正确样本，而且 `early_stop`、`parse_error_count` 有特殊实现语义。最稳妥的表述是 outcome、记录到的 unfinished 和 response-limit 在两个数据集上都向好，其余行为均值只用于提出可复验假设。

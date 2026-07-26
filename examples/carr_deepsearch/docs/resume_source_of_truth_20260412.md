@@ -1,4 +1,4 @@
-# CaRR DeepSearch Resume Source of Truth (2026-04-12)
+# CaRR DeepSearch Resume Source of Truth (2026-04-12, status updated 2026-07-26)
 
 ## 1. 项目一句话定义
 
@@ -7,8 +7,8 @@
 这份文档是当前项目对外表述的唯一事实源。任何后续写进简历、面试稿、项目介绍里的数字，都必须先在本文件中出现，并带上状态标签：
 
 - `Observed`: 本地日志、现有代码或已有文档可直接支持
-- `Estimated`: 当前无远端真实评测，按论文参考值做单点估计，仅用于简历草稿占位
-- `Pending`: 必须等新 GPU 上机后补齐，当前不写数字
+- `Estimated`: 只允许用于尚未执行的 full/128K 等可选扩展的内部情景草稿，不得进入正式简历
+- `Pending`: 尚未执行的可选扩展，当前不写数字；不代表本项目还没有完成简历闭环
 
 Recruiter-facing 简历 bullets 默认优先写“可理解的效果指标”，例如训练迭代时间、内部 anchor 的 outcome/unfinished 变化、和外部 sampled gate 的真实正向证据；`global_step_23`、`step70` 这类内部 checkpoint 语义只保留在证据层和面试展开里，不直接写进最终简历。
 
