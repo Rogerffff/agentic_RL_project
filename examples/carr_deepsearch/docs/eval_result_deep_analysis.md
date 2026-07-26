@@ -13,14 +13,16 @@
 1. **RL 训练显著提升了 accuracy**: dd111 outcome 18.0%→32.4% (+80% 相对提升), bc256 1.6%→3.5% (+119%)
 2. **Net gain 为正**: 33 gain samples vs 12 regression samples, net +21
 3. **所有 12 项指标在两个评测集上方向完全一致** (Task 3.11), 结论 robust
-4. **核心机制**: RL 模型学会了更好的终止判断 (early_stop ↑7.2%/+2.7%) 和更高效的搜索 (response_limit 截断 ↓13.5%/↓3.1%)
+4. **核心机制**: RL 模型 (a) 提升了任务完成率 (finished ratio ↑9.9%/+2.3%, response_limit 截断 ↓13.5%/↓3.1%)；(b) 输出更稳定地命中可被 trim 识别的最终答案格式 (early_stop ratio ↑7.2%/+2.7%——**注意这是 trim 格式信号而非"主动早停"**，详见 followup §7)
 5. **Finished-to-correct conversion rate 大幅提升**: dd111 66.7%→87.8%, bc256 36.4%→52.9%
-6. **content_early_stopped 与高 outcome 强相关**: early_stopped 样本 outcome mean 远高于整体 (dd111: 0.83 vs 0.32)
+6. **`content_early_stopped` 与高 outcome 相关，但本质是 trim 格式信号**: early_stopped 样本 outcome mean 高 (dd111: 0.83 vs 整体 0.32)。但**`content_early_stopped` 的真实判定是输出是否命中 trim 可识别的完整答案格式**（`## Exact Answer` + `## References` + 可裁剪引用段），代码中没有任何"主动停止"的硬路径，也没有消费 rollout 的 `stop_reason`。详见 followup §7
+
+> **⚠️ 命名陷阱说明**：本主分析早期把 `early_stop` 解读为"主动早停能力"是错误的。后续 followup 文档 §7 已详细修正：`early_stop` 的真实语义是"输出命中 trim 格式"，`natural` 是 `finished but trim-miss` 的残差 bucket。下文仍保留 `early_stop` / `natural` 这两个术语（代码字段名一致），但解读时应按修正后的语义理解。
 
 ### 简历 Bullet Points
 
 - Trained a 4B-param LLM agent with C-GRPO (async RL, 23 steps) to perform multi-hop web search; achieved **+80% relative accuracy gain** on DeepDive (18%→32%) and **+119%** on BrowseComp (1.6%→3.5%), with consistent improvement across all 12 tracked metrics on both benchmarks
-- Improved finished-to-correct conversion from 67% to 88% on DeepDive by teaching the agent better search termination and answer submission strategies through reinforcement learning
+- Improved finished-to-correct conversion from 67% to 88% on DeepDive through RL training, raising both task completion rate and answer quality across paired evaluation
 
 ---
 
@@ -399,11 +401,23 @@ SFT n=4, RL n=9
 | bc256_sft | 0.12 | 32/256 (12.5%) | 0.000 | 0.018 |
 | bc256_async23 | 0.12 | 31/256 (12.1%) | 0.000 | 0.040 |
 
-### Parse error 与提前终止的关联
-- dd111_sft: 无 parse_error>=3 的样本
-- dd111_async23: 无 parse_error>=3 的样本
-- bc256_sft: 无 parse_error>=3 的样本
-- bc256_async23: 无 parse_error>=3 的样本
+### Parse error 的真实含义与口径限制
+
+- 当前 `parse_error_count` 不是“纯 JSON 格式错误率”。它的统计口径是：
+  - 完整 `<tool_call>...</tool_call>` block 数减去成功解析出的 `tool_calls` 数
+  - 再加上未闭合的 `<tool_call>` 截断数
+- 在 4 个主评测里，所有 `parse_error_count>0` 的样本都只有 `1` 次，没有任何 `>=2` 或 `>=3` 的重复失败样本。
+- 这批样本里绝大多数并不是“模型多次写错工具调用后继续重试”：
+  - 总计 `78` 个 `parse_error_count>0` 样本中，`76/78` 的 `termination_reason` 都是 `response_limit`
+  - 其中 `19/78` 能在保存下来的 transcript 中直接看到半截 `<tool_call>`，属于尾部截断
+  - 只有 `2/78` 能在保存下来的 transcript 中直接看到明确的坏 JSON
+  - 剩余 `57/78` 在 `0.jsonl` 中看起来是“干净”的 `<tool_call>` 序列，但它们同样全部是 `response_limit` 样本
+- 最合理的解释是：
+  - 运行时统计看到了超过 `61440` token 上限后的尾部 `<tool_call>` 解析/截断事件
+  - 但 `eval_results/0.jsonl` 只保存了裁剪后的前 `61440` tokens，所以复盘时看不到那一小段坏尾巴
+- 因此，`parse_error_count>0` 与 `outcome=0` 的关系更应理解为：
+  - 它是“接近或撞上 response-limit 时的工具调用解析/截断事件”代理指标
+  - 它和失败高度相关，但不能直接解释为“模型看到了工具调用失败并进行了自我修正”
 
 # Task 3.11: 跨评测集一致性验证
 
@@ -438,11 +452,13 @@ dd111 上 RL 将 accuracy 从 18.0% 提升到 32.4%，净增 16 个正确样本�
 
 ### Task 3.1 面试展开版
 
-RL 模型并没有简单地增加搜索量——总 tool_call_counts 略降 (dd111: 48→47, bc256: 57→55)。关键提升来自 **finished-to-correct conversion rate**: dd111 66.7%→87.8%。这说明 RL 训练的主要效果不是"搜更多"而是"搜得更准、停得更好"。Outcome=1 样本的工具调用量 RL < SFT (dd111: 37.8 vs 42.8)，进一步支持"更高效搜索"的叙事。
+RL 模型并没有简单地增加搜索量——总 tool_call_counts 略降 (dd111: 48→47, bc256: 57→55)。关键提升来自 **finished-to-correct conversion rate**: dd111 66.7%→87.8%。这说明 RL 训练的主要效果不是"搜更多"而是"搜得更高效，并且更常在 response_limit 前成功交卷"。Outcome=1 样本的工具调用量 RL < SFT (dd111: 37.8 vs 42.8)，进一步支持"更高效搜索"的叙事。
 
 ### Task 3.2 面试展开版
 
-SFT→RL 的主要迁移路径：response_limit 截断减少 (dd111: -13.5%, bc256: -3.1%)，转移到了自然完成/early_stop (+9.9%/+2.3%) 和 search_budget 截断 (+5.4%/+1.2%)。这表明 RL 模型学会了在 response_limit 内完成任务，但部分样本因搜索更充分而触达 search_budget。这是一个合理的 tradeoff——宁可搜到 budget 上限，也不浪费 token 在低效搜索上。
+SFT→RL 的主要迁移路径：response_limit 截断减少 (dd111: -13.5%, bc256: -3.1%)，转移到了 finished completion (early_stop + natural, +9.9%/+2.3%) 和 search_budget 截断 (+5.4%/+1.2%)。这表明 RL 模型更稳定地在 response_limit 内完成任务并交卷，但部分样本因搜索更充分而触达 search_budget。这是一个合理的 tradeoff——宁可搜到 budget 上限，也不浪费 token 在低效搜索上。
+
+**注**：`early_stop ratio` 上升 (+7.2%/+2.7%) 不应被解读为"模型学会了主动早停"——`content_early_stopped` 的真实判定是 trim 模式检测（`## Exact Answer` + `## References` + 可裁剪引用段），本质是格式信号。详见 followup §7。
 
 ---
 
@@ -665,7 +681,7 @@ Unfinished with response_length_ratio > 0.95: 222/239
 
 ### Task 3.3 面试展开版
 
-关键发现：(1) 所有 unfinished 且 ratio>0.95 的样本都仍在搜索中，没有 near-miss（在交卷过程中被截断），说明模型的主要瓶颈是搜索效率而非最后交卷的 token 不够。(2) content_early_stopped 是非常强的正信号：dd111 RL 中 early_stopped 样本的 outcome 为 0.83，远高于整体的 0.32，说明 RL 模型学会了在有信心时果断提交答案。(3) Finished-but-wrong 审计发现少量 suspected false negatives (大小写/别名差异)，但数量不足以影响整体结论。
+关键发现：(1) 所有 unfinished 且 ratio>0.95 的样本都仍在搜索中，没有 near-miss（在交卷过程中被截断），说明模型的主要瓶颈是搜索效率而非最后交卷的 token 不够。(2) content_early_stopped 与高 outcome 相关：dd111 RL 中 early_stopped 样本的 outcome 为 0.83，远高于整体的 0.32。**注意**：经过对 trim 代码的逐行审计（详见 followup §7），`content_early_stopped` 的真实判定是输出是否命中 trim 可识别的完整答案格式（`## Exact Answer` + `## References` + 可裁剪引用段），**不是"模型有信心果断提交"**——模型按这种格式正常完成并返回，也会被打成 early_stop。这条相关性应解读为"trim 友好的交卷格式 → 更高完成率 → 更高 outcome"。(3) Finished-but-wrong 审计发现少量 suspected false negatives (大小写/别名差异)，但数量不足以影响整体结论。
 
 ---
 
@@ -686,21 +702,21 @@ Unfinished with response_length_ratio > 0.95: 222/239
 - **GTS**: DFT vs CI Determination of the Electron Transfer Matrix Element in Some Case Examples
 - **SFT**: response_limit 截断, 62 tool_calls, 60151 tokens → **失败**
 - **RL**: early_stop, 42 tool_calls, 53991 tokens → **成功**
-- **故事**: RL 用更少工具调用 (62→42) 更短轨迹 (60k→54k) 完成任务，SFT 被 response_limit 截断时 RL 已主动停止并提交正确答案
+- **故事**: RL 用更少工具调用 (62→42) 更短轨迹 (60k→54k) 完成任务，SFT 被 response_limit 截断时 RL 已成功进入 finished bucket 并提交正确答案
 
 ### Top 2: dd111 Row 100
 - **Question**: 光核反应相关物理论文
 - **GTS**: Photodisintegration of Light Nuclei
 - **SFT**: response_limit 截断, 43 tool_calls, 59375 tokens → **失败**
 - **RL**: early_stop, 20 tool_calls, 29429 tokens → **成功**
-- **故事**: 最显著的效率提升案例——tool_calls 减半 (43→20)，token 用量减半 (59k→29k)，典型的"搜得更准、停得更早"
+- **故事**: 最显著的效率提升案例——tool_calls 减半 (43→20)，token 用量减半 (59k→29k)，典型的"搜得更准、收敛更快"
 
 ### Top 3: dd111 Row 86
 - **Question**: 铁电陶瓷力学载荷损伤机理
 - **GTS**: Damage Mechanism for Ferroelectric Ceramics with Mechanical Loading
 - **SFT**: response_limit 截断, 56 tool_calls, 60564 tokens → **失败**
 - **RL**: early_stop, 42 tool_calls, 43372 tokens → **成功**
-- **故事**: SFT 搜到 response_limit 仍未收敛，RL 在 43k tokens 时就果断提交
+- **故事**: SFT 搜到 response_limit 仍未收敛，RL 在 43k tokens 时就已成功交卷
 
 ### Top 4: dd111 Row 83
 - **Question**: 多元分布的失真表示
@@ -712,16 +728,16 @@ Unfinished with response_length_ratio > 0.95: 222/239
 - **Question**: 时滞微分代数捕食者-猎物系统的分岔
 - **GTS**: Bifurcation in a Differential-Algebra Predator-Prey System with Time Lag Effects
 - **SFT**: response_limit 截断, 44 tool_calls, 58128 tokens → **失败**
-- **RL**: natural 完成, 28 tool_calls, 25523 tokens → **成功**
+- **RL**: 落在 natural bucket, 28 tool_calls, 25523 tokens → **成功**
 - **故事**: token 用量降低 56% (58k→25k)，tool_calls 降低 36% (44→28)
 
 ### 增益样本共性模式
 
 Top 5 案例展示了一个清晰的共性模式：
-1. **SFT 被 response_limit 截断 → RL 主动 early_stop 或 natural 完成**: 5/5 案例都是这个模式
+1. **SFT 被 response_limit 截断 → RL 进入 finished bucket（early_stop 或 natural）**: 5/5 案例都是这个模式
 2. **更少的 tool_calls**: 平均 49→33 (-33%)
 3. **更短的 response_length**: 平均 59.8k→39.3k (-34%)
-4. **核心叙事**: RL 训练教会了模型"何时该停止搜索并提交答案"，这是最主要的 accuracy 提升来源
+4. **核心叙事**: RL 训练提升了搜索收敛效率，让模型更常在 response_limit 前完成并交卷，这是最主要的 accuracy 提升来源
 
 ---
 
@@ -946,8 +962,8 @@ Rubric reward 只有 outcome=1 的样本才非零（100% 对应关系）。RL �
 
 ### Task 3.10 面试展开版
 
-Parse error 很少 (mean <0.13)，且有 parse_error 的样本 outcome=0（100%）。这说明 parse error 虽罕见但致命——一旦出现工具调用解析错误，该样本基本确定失败。RL 训练略微降低了 parse error 率（dd111: 6.3%→4.5%），但差异很小。无高频 parse error (≥3) 样本，工具调用格式整体可靠。
+`parse_error_count` 在当前实现里更像“工具调用解析/截断事件”代理指标，而不是纯粹的 JSON 格式错误率。4 个主评测里所有 `parse_error_count>0` 的样本都只有 `1` 次，没有高频重复失败；其中绝大多数是 `response_limit` 样本，很多问题发生在超过 `61440` token 上限后的尾部 `<tool_call>`。因此可以说：`parse_error_count>0` 与失败高度相关，但它主要反映长轨迹末尾的 tool-call 尾部损坏/截断，而不能讲成“模型中途多次调用工具失败后又继续重试”。RL 在这个代理指标上略有下降（dd111: 6.3%→4.5%，bc256: 12.5%→12.1%），但这只是次要现象，不应当作为主要改进点。
 
 ### Task 3.11 面试展开版
 
-**所有 12 项指标在 dd111 和 bc256 上方向完全一致**——这是最强的 robustness 证据。两个数据集难度差异巨大（dd111 unfinished 63% vs bc256 93%），但 RL 训练的效果方向一致：accuracy ↑, unfinished ↓, early_stop ↑, response_length ↓, tool_calls ↓, rollout_time ↓, parse_error ↓。这说明 RL 学到的搜索策略提升是 generalizable 的，而非在特定数据集上过拟合。
+**所有 12 项指标在 dd111 和 bc256 上方向完全一致**——这是很强的 robustness 证据。两个数据集难度差异巨大（dd111 unfinished 63% vs bc256 93%），但 RL 训练的主效应方向一致：accuracy ↑, unfinished ↓, early_stop ↑, response_length ↓, tool_calls ↓, rollout_time ↓。`parse_error_count` 的方向也一致，但由于它混合了真实坏 JSON 与 response-limit 尾部截断，不应当被当作和 accuracy 同等级的核心证据。更稳的结论是：RL 学到的搜索策略提升在两个数据集上都表现为更容易完成、更少撞上 token limit，而不是依赖某个单独的格式性指标。

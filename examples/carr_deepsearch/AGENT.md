@@ -44,6 +44,149 @@ bash examples/carr_deepsearch/scripts/run_rl.sh \
 
 ---
 
+## 资产索引（建议先看这里）
+
+### 0. 先分清主工作树和历史快照
+
+- `examples/carr_deepsearch/` 是当前主工作树，最新代码、评测产物、文档结论都以这里为准。
+- `examples/carr_deepsearch/CaRR_repo/` 是从远端机器下载下来的完整 repo 快照，适合核对历史脚本、旧环境和远端目录结构，不应默认当作当前事实源。
+- `examples/carr_deepsearch/eval_results/` 保存样本级最终输出；`examples/carr_deepsearch/CaRR_log/` 保存 launcher、tool、reward、trace 等运行时原始日志。
+- 新机器通过 Git 克隆时，`eval_results/`、部分原始日志、Parquet 数据、密钥和 `CaRR_repo/` 不会自动出现。这些路径属于旧 Mac 本地资产，具体范围和恢复方式见 `docs/new_mac_migration_20260726.md`。
+
+### 1. 想快速理解“项目当前状态”，先看这些文件
+
+| 目标 | 首选文件 | 用途 |
+|------|----------|------|
+| 看当前 async 主线、checkpoint、训练口径 | `docs/agent_handoff_background_20260321.md` | 当前最接近交接总览的背景文档 |
+| 看完整训练时间线（sync → async、budget、b/n 变化） | `docs/training_full_history_20260404.md` | 追溯所有关键配置和训练阶段 |
+| 看最新真实 eval 结论 | `docs/eval_analysis_20260415.md` | 汇总 DeepDive / BrowseComp 的最终结果和主要结论 |
+| 看样本级 case study 与 failure mode | `docs/eval_result_deep_analysis.md`、`docs/eval_result_deep_analysis_followup.md` | paired case、retention、parse-error caveat、thinking-only failure |
+| 看简历可写 claim 与状态标签 | `docs/resume_source_of_truth_20260412.md`、`docs/final_resume_ready.md` | resume bullets、claim 状态、最终对外表达 |
+| 看面试问答素材 | `docs/interview_qa_bank_20260412.md` | 面试官可能追问的问题与回答框架 |
+
+### 2. 评测资产
+
+#### `eval_results/` — 样本级最终输出
+
+| 路径 | 说明 |
+|------|------|
+| `eval_results/dd111_sft/0.jsonl` | `DeepDive rl_val 111` 的 SFT 基线输出 |
+| `eval_results/dd111_async23/0.jsonl` | `DeepDive rl_val 111` 的 async23 输出 |
+| `eval_results/async23_dd64_sanity/0.jsonl` | `DeepDive subset64` 的 async23 sanity eval |
+| `eval_results/bc256_sft_relaxed_v2/0.jsonl` | `BrowseComp subset256 64k` 的 SFT 输出 |
+| `eval_results/bc256_async23_relaxed_v2/0.jsonl` | `BrowseComp subset256 64k` 的 async23 输出 |
+
+#### `CaRR_log/20260415_gpu_eval/` — 与上述 eval 对应的原始日志
+
+- 每个 eval run 通常有 6 类文件：
+  - `*.launcher.log`: 启动与 trainer 主日志
+  - `*.log`: eval 主输出
+  - `*.status`: 运行状态
+  - `*_reward.log` / `*_reward_trace.jsonl`: reward server 日志与逐样本 trace
+  - `*_tool.log` / `*_tool_stats.json`: tool server 日志与聚合统计
+- 这些原始日志对应当前最重要的 5 个 eval：
+  - `dd111_sft`
+  - `dd111_async23`
+  - `bc256_sft_relaxed_v2`
+  - `bc256_async23_relaxed_v2`
+  - `async23_dd64_sanity`
+
+#### 旧评测 / checkpoint selection 日志
+
+- `CaRR_log/step70_dd64_8gpu_20260322_153257.*`: `step70` 的 `DeepDive subset64 sampled` eval
+- `CaRR_log/step90_dd64_8gpu_20260322_151340.*`: `step90` 的 `DeepDive subset64 sampled` eval
+- `CaRR_log/eval_gate_20260323_144500_*`: `SFT / step90` gate 相关日志
+- 这些日志主要用于说明为什么 `step70` 被选作 async 起点，以及早期 gate 的真实指标来源
+
+### 3. 训练日志与运行历史
+
+| 路径 | 说明 |
+|------|------|
+| `CaRR_formal_training_log/output.log` | 同步 RL 正式训练主日志 |
+| `CaRR_formal_training_log/40.jsonl`、`CaRR_formal_training_log/80.jsonl` | sync 训练中的中间 eval / dump 产物 |
+| `CaRR_log/formal_mainline_*` | 正式 async mainline 的关键训练日志 |
+| `CaRR_log/phase0_*`、`phase1_*`、`phase2*` | fully-async probe / bring-up 各阶段日志 |
+| `CaRR_log/gate_b4_n8_*`、`validate_b4_n8_*` | async 配置探索、resume 和 gate 日志 |
+| `CaRR_log/latest_checkpointed_iteration.txt` | 最新 durable checkpoint 记录 |
+
+### 4. 代码实现资产
+
+| 路径 | 说明 |
+|------|------|
+| `tools/carr_agent_loop.py` | 同步/异步 CaRR agent loop，含 reward history、budget、partial rollout 状态持久化 |
+| `tools/carr_browser_tool.py` | browser.search/open/find 适配层 |
+| `tools/carr_session_manager.py` | request-level session 生命周期管理 |
+| `reward/carr_reward.py` | reward bridge，连接 reward server |
+| `reward/cgrpo_advantage.py` | C-GRPO reward fusion / advantage 实现 |
+| `reward/async_base_reward.py` | async base probe 的 dummy reward |
+| `config/` | SFT、sync RL、async RL、tool schema 配置 |
+| `scripts/` | 训练、eval、subset 准备、checkpoint 选择和一致性验证脚本 |
+
+如果要理解 async infra，本目录外还需要同时看：
+
+- `verl/experimental/fully_async_policy/fully_async_main.py`
+- `verl/experimental/fully_async_policy/fully_async_rollouter.py`
+- `verl/experimental/fully_async_policy/fully_async_trainer.py`
+- `verl/experimental/fully_async_policy/param_sync.py`
+
+### 5. 数据资产
+
+| 路径 | 说明 |
+|------|------|
+| `data/sft_train.parquet`、`data/sft_val.parquet` | SFT 训练 / 验证数据 |
+| `data/rl_train.parquet`、`data/rl_val.parquet` | RL 训练 / 验证数据 |
+| `data/rl_val_subset_64_seed42.parquet` | `DeepDive subset64` gate / sanity eval 数据 |
+| `data/browsecomp_eval.parquet` | 完整 BrowseComp eval 数据 |
+| `data/browsecomp_eval_subset_256_seed42.parquet` | 当前最常用的 BrowseComp subset256 |
+| `data_preprocess/` | CaRR SFT / RL / BrowseComp 到 verl parquet 的预处理脚本 |
+
+### 6. 文档资产
+
+#### 项目与训练背景
+
+- `CODE_WALKTHROUGH.md`: 代码入口导览
+- `DEVELOPMENT_LOG.md`: 开发阶段记录
+- `docs/project_retrospective_20260312.md`: 训练前复盘与问题归因
+- `docs/rl_debug_findings_20260312.md`: RL / eval 细节坑位索引
+- `docs/async_rl_explainer_20260321.md`: async 结构化解释
+- `docs/sync_vs_async_grpo_update_mechanics.md`: sync / async 更新机制对比
+
+#### 评测与结果分析
+
+- `docs/eval.md`: 评测总说明
+- `docs/eval_analysis_20260415.md`: 当前最重要的结果总结
+- `docs/eval_result_deep_analysis.md`: 深入行为分析
+- `docs/eval_result_deep_analysis_followup.md`: finished-but-wrong、retention、oracle 等补充分析
+- `docs/carr_paper_training_analysis_20260416.md`: 论文训练现象与本项目结果对照
+
+#### 简历与面试材料
+
+- `docs/resume_source_of_truth_20260412.md`: 简历事实源
+- `docs/final_resume_ready.md`: 对外展示版 resume 文案
+- `docs/interview_qa_bank_20260412.md`: 面试 Q&A 题库
+- `resume_design_and_question/`: 更早期的简历草稿与面试资料备份
+
+#### GPU / 执行计划
+
+- `docs/post_gpu_revalidation_plan_20260412.md`: GPU 复验 runbook
+- `docs/gpu_execution_plan.md`: GPU 评测执行计划
+- `docs/gpu_eval_recommendations_20260404.md`: Claude 给出的 GPU 评测建议
+
+### 7. 远端快照与备份资产
+
+| 路径 | 说明 |
+|------|------|
+| `CaRR_repo/` | 远端整仓快照；适合核对历史 repo 状态、旧脚本和原始文档 |
+| `remote_artifacts/h200_20260312/` | H200 机器上的 ray / wandb / logs 备份 |
+| `artifacts/huggingface/` | 本地保存的 HuggingFace 产物目录 |
+
+### 8. 查找建议
+
+1. 先看 `docs/agent_handoff_background_20260321.md`、`docs/training_full_history_20260404.md`、`docs/eval_analysis_20260415.md`。
+2. 要看真实样本行为，先看 `eval_results/*.jsonl`，再对照 `CaRR_log/20260415_gpu_eval/` 的 tool / reward trace。
+3. 要理解“为什么会这样”，再看 `docs/eval_result_deep_analysis.md` 和 `docs/eval_result_deep_analysis_followup.md`。
+4. 要改代码时，优先在当前主工作树里看 `tools/`、`reward/`、`config/`、`scripts/`，不要默认去 `CaRR_repo/` 里改。
+
 ## 本目录文件结构
 
 ### config/ — Hydra 训练配置
